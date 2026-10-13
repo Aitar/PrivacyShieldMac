@@ -84,6 +84,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
         
         // Calibration
+        let calibrateDirectionItem = NSMenuItem(title: "Calibrate Screen Direction…", action: #selector(calibrateScreenDirection), keyEquivalent: "")
+        calibrateDirectionItem.target = self
+        menu.addItem(calibrateDirectionItem)
+        
         let calibrateItem = NSMenuItem(title: "Calibrate Detection Range…", action: #selector(calibrateRange), keyEquivalent: "")
         calibrateItem.target = self
         menu.addItem(calibrateItem)
@@ -93,6 +97,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let thresholdItem = NSMenuItem(title: thresholdLabel, action: nil, keyEquivalent: "")
         thresholdItem.tag = 300
         menu.addItem(thresholdItem)
+        
+        // Debug-only: current calibrated screen center (updates via tag 400)
+        if UserDefaults.standard.bool(forKey: "debugLoggingEnabled") {
+            let centerItem = NSMenuItem(title: screenCenterMenuLine(), action: nil, keyEquivalent: "")
+            centerItem.tag = 400
+            menu.addItem(centerItem)
+        }
         
         menu.addItem(NSMenuItem.separator())
         
@@ -187,6 +198,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+    
+    @objc func calibrateScreenDirection() {
+        guard let detector = faceDetector else { return }
+        guard !detector.isScreenCalibrating else {
+            Toast.show(message: "Calibration already running", duration: 2)
+            return
+        }
+        
+        Toast.show(message: "Sit in your normal position, look at the center of the screen…\nCalibration starts in a few seconds.", duration: 4)
+        
+        // Delay slightly so user can settle (the detector adds its own 2 s lead-in)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self = self, let detector = self.faceDetector else { return }
+            guard !detector.isScreenCalibrating else { return }
+            detector.startScreenDirectionCalibration { success, result in
+                if success, let result = result {
+                    Toast.show(message: String(format: "✅ Screen direction calibrated — center yaw %+.1f°, pitch %+.1f°", result.centerYaw, result.centerPitch), duration: 3)
+                } else {
+                    Toast.show(message: "❌ Calibration failed — not enough valid samples; make sure your face is visible and well lit", duration: 3)
+                }
+                // Recalibration overwrote the store — refresh the debug line
+                DispatchQueue.main.async { [weak self] in
+                    self?.refreshScreenCenterMenuLine()
+                }
+            }
+        }
+    }
+    
+    /// Debug-mode menu line showing the currently stored screen center.
+    private func screenCenterMenuLine() -> String {
+        if let center = ScreenCenterStore.load() {
+            return String(format: "Screen center: yaw %+.1f°, pitch %+.1f°", center.yaw, center.pitch)
+        }
+        return "Screen center: not calibrated"
+    }
+    
+    /// Updates the debug-only screen center line (tag 400) in the live menu.
+    private func refreshScreenCenterMenuLine() {
+        guard UserDefaults.standard.bool(forKey: "debugLoggingEnabled"),
+              let menu = statusItem.menu, let item = menu.item(withTag: 400) else { return }
+        item.title = screenCenterMenuLine()
     }
     
     // MARK: - Global Hotkey (⌘⇧L)
