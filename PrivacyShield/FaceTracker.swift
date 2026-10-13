@@ -63,6 +63,12 @@ struct FaceTrack {
     /// Consecutive frames (process calls) in which this track went
     /// unmatched. Reset to 0 on every match.
     var consecutiveMisses: Int
+    /// Latest head-pose reading for this track (M2-T03). `nil` until the
+    /// first evaluation; `.unavailable` is a distinct, explicit state (Vision
+    /// supplied no complete pose) and is never conflated with a frontal
+    /// pose. Written by the detector via `updateHeadPose`. Defaulted so
+    /// existing memberwise initializers keep compiling.
+    var latestHeadPose: HeadPoseResult? = nil
 }
 
 // MARK: - Tunables (M2-T01, X-T01: all knobs in one place)
@@ -289,7 +295,8 @@ final class FaceTracker {
                 lastNegativeAt: nil,
                 createdAt: date,
                 hitCount: 1,
-                consecutiveMisses: 0
+                consecutiveMisses: 0,
+                latestHeadPose: nil
             )
             records[track.id] = track
             result.newTracks.append(track.id)
@@ -384,6 +391,20 @@ final class FaceTracker {
         track.lookingSince = lookingSince
         if let positiveAt { track.lastPositiveAt = positiveAt }
         if let negativeAt { track.lastNegativeAt = negativeAt }
+        records[id] = track
+        syncSnapshot(track)
+        return true
+    }
+
+    /// Writes one head-pose reading onto the track (M2-T03). Unlike the
+    /// marker semantics of `updateAttention`, `nil`-lessness does not apply:
+    /// every call overwrites, and `.unavailable` is a real value that must
+    /// replace a stale `.valid` pose so debug output never shows an old
+    /// reading as current. Returns `false` if the track no longer exists.
+    @discardableResult
+    func updateHeadPose(id: UUID, headPose: HeadPoseResult) -> Bool {
+        guard var track = records[id] else { return false }
+        track.latestHeadPose = headPose
         records[id] = track
         syncSnapshot(track)
         return true

@@ -77,35 +77,57 @@ class FaceRecognizer {
     }
     
     // MARK: - Recognition
-    
-    func isOwner(pixelBuffer: CVPixelBuffer, faceRect: CGRect) -> Bool {
-        guard isEnrolled else { return true }
-        
+
+    /// Returns the enrolled label whose feature print best matches the face
+    /// cropped from `faceRect`, or `nil` when nothing matches within
+    /// `matchThreshold` (or no feature print could be generated for the crop).
+    ///
+    /// Pure label lookup with no owner special case: callers map the label to
+    /// an `IdentityState` ("owner" → .owner, "trusted…" → .trusted, nil →
+    /// .other). M2-T06's recognition caching calls this instead of `isOwner`
+    /// so per-track identity can distinguish WHO matched, not just whether
+    /// someone enrolled did.
+    ///
+    /// Not-enrolled behavior stays in the callers: this returns `nil` when no
+    /// user is enrolled, while `isOwner` keeps returning `true` in that case
+    /// (M1 semantics — nobody is a stranger until someone enrolls).
+    func identify(pixelBuffer: CVPixelBuffer, faceRect: CGRect) -> String? {
+        guard isEnrolled else { return nil }
+
         guard let facePrint = generateFacePrint(from: pixelBuffer, faceRect: faceRect) else {
-            return false
+            return nil
         }
-        
-        // Check against ALL enrolled users
+
+        // Best (label, distance) across ALL enrolled users and their prints.
+        var bestLabel: String?
+        var bestDistance: Float = Float.greatestFiniteMagnitude
         for (label, prints) in enrolledUsers {
-            var bestDistance: Float = Float.greatestFiniteMagnitude
             for ownerPrint in prints {
                 var distance: Float = 0
                 do {
                     try facePrint.computeDistance(&distance, to: ownerPrint)
                     if distance < bestDistance {
                         bestDistance = distance
+                        bestLabel = label
                     }
                 } catch {
                     continue
                 }
             }
-            
-            if bestDistance < matchThreshold {
-                return true  // Matches an enrolled user
-            }
         }
-        
-        return false  // No match found → stranger
+
+        guard let label = bestLabel, bestDistance < matchThreshold else {
+            return nil  // No match found → stranger
+        }
+        return label
+    }
+
+    func isOwner(pixelBuffer: CVPixelBuffer, faceRect: CGRect) -> Bool {
+        guard isEnrolled else { return true }
+
+        // Refactored onto identify() (M2-T06) with identical behavior: true
+        // iff ANY enrolled label has a print within `matchThreshold`.
+        return identify(pixelBuffer: pixelBuffer, faceRect: faceRect) != nil
     }
     
     // MARK: - Feature Print Generation
