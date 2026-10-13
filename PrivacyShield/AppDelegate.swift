@@ -3,12 +3,134 @@ import Foundation
 import Carbon.HIToolbox
 import UserNotifications
 
+// MARK: - Display-state → UI mappings (M4-T04)
+
+/// Menu-bar status line for each display state. Pure mapping so the
+/// differentiated texts — including calibration and camera-unavailable — are
+/// testable now and M4-T06 can drive them from `privacyStateChanged(to:)`.
+/// The legacy `updateMenuIcon(safe:)` path renders the same texts whenever a
+/// state has been reported (see `AppDelegate.statusLineText`).
+extension PrivacyDisplayState {
+    var statusText: String {
+        switch self {
+        case .monitoringSafe: return "Status: ✅ Monitoring safe"
+        case .ownerAbsent: return "Status: 🚪 Owner away — blurred"
+        case .shoulderSurferDetected: return "Status: 👀 Observer detected — blurred"
+        case .bothPoliciesActive: return "Status: ⚠️ Owner away + observer — blurred"
+        case .calibrating: return "Status: 🎯 Calibrating…"
+        case .cameraUnavailable: return "Status: 📷 Camera unavailable"
+        }
+    }
+
+    /// The shield reason this state should notify about, or nil when the
+    /// state carries no blur demand: safe, calibrating and camera-unavailable
+    /// never notify.
+    var notificationReason: PrivacyShieldReason? {
+        switch self {
+        case .monitoringSafe, .calibrating, .cameraUnavailable: return nil
+        case .ownerAbsent: return .ownerAbsent
+        case .shoulderSurferDetected: return .shoulderSurfer
+        case .bothPoliciesActive: return .both
+        }
+    }
+}
+
+/// Reason-aware notification body (M4-T04): the user is told WHY the screen
+/// is protected instead of receiving one undifferentiated "stranger" signal.
+/// The title is the constant "⚠️ Privacy Shield" for every reason; `.none`
+/// never notifies.
+extension PrivacyShieldReason {
+    var notificationBody: String? {
+        switch self {
+        case .shoulderSurfer:
+            return "Someone appears to be looking at your screen. Screen has been blurred."
+        case .ownerAbsent:
+            return "You stepped away — screen has been blurred."
+        case .both:
+            return "Owner away and someone is looking at your screen. Screen has been blurred."
+        case .none:
+            return nil
+        }
+    }
+}
+
+/// Anti-spam gate for shield notifications (M4-T04): at most one notification
+/// per shield EPISODE, never twice for the same reason within an episode, and
+/// a configurable minimum interval between two sends inside one episode
+/// (reason-change updates). Pure logic — the caller injects `now`.
+///
+/// Episode lifecycle: the first blur reason opens an episode; `.none` (shield
+/// hidden) closes it and resets everything, so the next blur starts a fresh
+/// episode and notifies again. Blocked (interval-skipped) attempts consume
+/// nothing: only successful sends are remembered, so a dropped reason-change
+/// update may still fire once the interval has elapsed.
+struct NotificationGate {
+    /// Minimum seconds between two sends within one episode. A reason-change
+    /// update arriving sooner is dropped (not queued); the episode's first
+    /// send is never interval-checked (`lastSendDate` resets with the
+    /// episode).
+    var minUpdateInterval: TimeInterval = 10
+
+    /// True from the first send of an episode until it is closed.
+    private(set) var isEpisodeActive = false
+    /// Reasons already sent in the current episode (never re-notified).
+    private(set) var notifiedReasons: [PrivacyShieldReason] = []
+    /// When the current episode last actually sent (interval anchor).
+    private(set) var lastSendDate: Date?
+
+    /// Applies the anti-spam rules to one notification attempt for `reason`
+    /// at `date`. `.none` never sends and closes the current episode (shield
+    /// hidden → episode over).
+    mutating func shouldSend(for reason: PrivacyShieldReason, at date: Date) -> Bool {
+        guard reason != .none else {
+            endEpisode()
+            return false
+        }
+        if isEpisodeActive {
+            // Never re-notify for the same reason within an episode.
+            if notifiedReasons.contains(reason) { return false }
+            // A different-reason update waits out the min interval, measured
+            // from the last actual send (a blocked attempt is not an anchor).
+            if let last = lastSendDate,
+               date.timeIntervalSince(last) < minUpdateInterval {
+                return false
+            }
+        }
+        isEpisodeActive = true
+        notifiedReasons.append(reason)
+        lastSendDate = date
+        return true
+    }
+
+    /// Closes the current episode (if any): the next blur reason notifies
+    /// again immediately, regardless of interval.
+    mutating func endEpisode() {
+        isEpisodeActive = false
+        notifiedReasons = []
+        lastSendDate = nil
+    }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var cameraManager: CameraManager?
     var faceDetector: FaceDetector?
     var shieldManager: ShieldManager?
     private var hotKeyRef: EventHotKeyRef?
+
+    // M4-T04: reason-aware notifications + menu status line
+    /// Anti-spam gate for the reason-aware shield notifications (one send per
+    /// episode, per-reason dedup, min interval between reason-change updates).
+    private var notificationGate = NotificationGate()
+    /// Last display state reported via `privacyStateChanged(to:)`. nil until
+    /// the M4-T06 integration starts reporting; the legacy
+    /// `updateMenuIcon(safe:)` path then falls back to the generic
+    /// safe/shield-active line because it cannot name the reason.
+    private var lastDisplayState: PrivacyDisplayState?
+    /// Last safe flag seen by `updateMenuIcon(safe:)` — together with
+    /// `lastDisplayState` it decides the rendered status line, whichever
+    /// path reported last.
+    private var lastKnownSafe = true
     
     // Settings
     var sensitivityThreshold: Float {
@@ -130,17 +252,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func updateMenuIcon(safe: Bool) {
         DispatchQueue.main.async { [weak self] in
-            guard let button = self?.statusItem.button else { return }
+            guard let self = self, let button = self.statusItem.button else { return }
             let symbolName = safe ? "eye" : "eye.slash.fill"
             if let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Privacy Shield") {
                 image.isTemplate = true
                 button.image = image
             }
-            // Update status text in menu
-            if let menu = self?.statusItem.menu, let item = menu.item(withTag: 100) {
-                item.title = safe ? "Status: ✅ Owner detected" : "Status: ⚠️ Shield active"
+            self.lastKnownSafe = safe
+            if safe {
+                // Shield hidden → the notification episode is over (the
+                // M4-T06 reason path ends it too, via .monitoringSafe).
+                self.notificationGate.endEpisode()
+            }
+            self.applyStatusLine()
+        }
+    }
+
+    /// Renders the menu status line (tag 100) from the last known signals.
+    /// Main queue only; called after either signal changes so both the
+    /// legacy `updateMenuIcon(safe:)` path and the M4-T06
+    /// `privacyStateChanged(to:)` path stay consistent.
+    private func applyStatusLine() {
+        guard let menu = statusItem.menu, let item = menu.item(withTag: 100) else { return }
+        item.title = statusLineText()
+    }
+
+    /// The status line for the CURRENT signals: a reported display state wins
+    /// when it agrees with the legacy safe flag; otherwise the generic
+    /// fallback that matches what the legacy safe/unsafe signal can know (the
+    /// pre-M4-T06 combined path ORs the owner-absent debounce with the
+    /// attention alert, so an unsafe report alone cannot name the reason).
+    private func statusLineText() -> String {
+        if let state = lastDisplayState {
+            switch (lastKnownSafe, state) {
+            case (true, .calibrating), (true, .cameraUnavailable):
+                // Detector-side device states stay visible while the camera
+                // reports safe (no blur is demanded during them).
+                return state.statusText
+            case (false, let reported) where reported.isShieldShown:
+                return reported.statusText
+            default:
+                break  // Stale/contradictory report → generic fallback below.
             }
         }
+        return lastKnownSafe
+            ? PrivacyDisplayState.monitoringSafe.statusText
+            : "Status: ⚠️ Shield active"
     }
     
     // MARK: - Actions
@@ -308,17 +465,70 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
+    /// Legacy undifferentiated entry point (FaceDetectorDelegate
+    /// requirement). The pre-M4-T06 combined path cannot tell WHY the shield
+    /// came on (it ORs the owner-absent debounce with the attention alert),
+    /// so it reports the shoulder-surf reason — the closest match to the old
+    /// "unrecognized face" text. M4-T06 replaces this with reason-aware
+    /// `privacyStateChanged(to:)` reporting.
     func sendStrangerNotification() {
+        sendNotification(for: .shoulderSurfer)
+    }
+
+    /// Sends the reason-aware shield notification (M4-T04), gated by
+    /// `NotificationGate` anti-spam rules (one send per episode, never twice
+    /// for the same reason, ≥ minUpdateInterval between in-episode
+    /// reason-change updates). Safe to call from any queue: the gate and the
+    /// post run on the main queue in FIFO order relative to the other UI
+    /// mutations.
+    func sendNotification(for reason: PrivacyShieldReason) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let now = Date()
+            guard self.notificationGate.shouldSend(for: reason, at: now) else { return }
+            self.postShieldNotification(reason: reason, at: now)
+        }
+    }
+
+    /// Builds and posts one notification with the reason-specific body.
+    /// Main queue only.
+    private func postShieldNotification(reason: PrivacyShieldReason, at date: Date) {
         let content = UNMutableNotificationContent()
         content.title = "⚠️ Privacy Shield"
-        content.body = "An unrecognized face was detected. Screen has been blurred."
+        content.body = reason.notificationBody ?? "Screen has been blurred."
         content.sound = .default
-        
-        let request = UNNotificationRequest(identifier: "stranger_\(Date().timeIntervalSince1970)", content: content, trigger: nil)
+
+        let request = UNNotificationRequest(
+            identifier: "shield_\(reason.description)_\(date.timeIntervalSince1970)",
+            content: content,
+            trigger: nil)
         UNUserNotificationCenter.current().add(request)
+    }
+
+    /// Display-state reporting (PrivacyDisplayReporting, M4-T04): records the
+    /// state, feeds the notification gate and re-renders the status line.
+    /// The detector side (M4-T06) calls this on state transitions only. Safe
+    /// to call from any queue; the whole body runs on the main queue.
+    func privacyStateChanged(to state: PrivacyDisplayState) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.lastDisplayState = state
+            switch state.notificationReason {
+            case .some(let reason):
+                self.sendNotification(for: reason)
+            case .none:
+                // Back to safe → the episode is over. Calibration and camera
+                // states never notify and never touch the episode.
+                if state == .monitoringSafe {
+                    self.notificationGate.endEpisode()
+                }
+            }
+            self.applyStatusLine()
+        }
     }
 }
 
 import ServiceManagement
 
 extension AppDelegate: FaceDetectorDelegate {}
+extension AppDelegate: PrivacyDisplayReporting {}

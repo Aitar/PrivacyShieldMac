@@ -186,3 +186,70 @@ struct PrivacyStateMachine {
                  shoulderSurferDetected: state.shoulderSurferDetected)
     }
 }
+
+// MARK: - Display state (M4-T04; reported to the app delegate)
+
+/// Aggregate display state the detector reports to the app delegate (M4-T06
+/// implements the FaceDetector side; until then the protocol default keeps
+/// the app compiling).
+///
+/// Coarser than `PrivacyShieldReason`: besides the three blur states (which
+/// map 1:1 onto the reason cases) it names the device/app-level states the
+/// user should see — calibration in progress and camera unavailable. The
+/// app delegate derives the menu status line and the reason-aware
+/// notification content from this state.
+enum PrivacyDisplayState: Equatable {
+    /// Shield hidden, owner present, nothing alerting.
+    case monitoringSafe
+    /// Only the owner-absent policy is blurring.
+    case ownerAbsent
+    /// Only the shoulder-surf policy is blurring.
+    case shoulderSurferDetected
+    /// Both policies are blurring.
+    case bothPoliciesActive
+    /// A calibration session is collecting samples.
+    case calibrating
+    /// The camera could not deliver frames (permission denied, device gone).
+    case cameraUnavailable
+
+    /// Whether this state itself demands the blur shield — exactly the three
+    /// blur states, mirroring `PrivacyShieldReason.isShieldShown`. The
+    /// calibration and camera-unavailable states describe the DETECTOR, not
+    /// the shield: whether the shield stays shown during them is the
+    /// caller's policy, so they report `false` here.
+    var isShieldShown: Bool {
+        switch self {
+        case .monitoringSafe, .calibrating, .cameraUnavailable: return false
+        case .ownerAbsent, .shoulderSurferDetected, .bothPoliciesActive: return true
+        }
+    }
+}
+
+// MARK: - Display-state reporting contract (M4-T04)
+
+/// Delegate contract for display-state reporting (M4-T04): the detector
+/// pushes every aggregated display-state change so the app delegate can
+/// render the menu status line and send reason-aware notifications.
+///
+/// Design note — why a SEPARATE protocol instead of a default-implementation
+/// extension on `FaceDetectorDelegate` (which lives in FaceDetector.swift and
+/// stays untouched until M4-T06): both compile, but a protocol-extension
+/// method that is not a protocol requirement dispatches STATICALLY through
+/// the existential — an override in the conforming AppDelegate would never be
+/// reached via a `FaceDetectorDelegate` reference. As a real requirement,
+/// `privacyStateChanged(to:)` dispatches dynamically, and M4-T06 can reach it
+/// with an optional cast
+/// (`(delegate as? PrivacyDisplayReporting)?.privacyStateChanged(to:)`)
+/// without modifying FaceDetector.swift.
+protocol PrivacyDisplayReporting: AnyObject {
+    /// The aggregated display state changed. Implementations hop to the main
+    /// queue themselves; the detector calls this only on state TRANSITIONS
+    /// (no per-frame spam), mirroring the edge-driven shield updates.
+    func privacyStateChanged(to state: PrivacyDisplayState)
+}
+
+extension PrivacyDisplayReporting {
+    /// Default no-op: conformers that do not care about display state keep
+    /// compiling unchanged until the M4-T06 integration starts calling this.
+    func privacyStateChanged(to state: PrivacyDisplayState) {}
+}
