@@ -17,8 +17,9 @@ import Foundation
 
 /// User-facing sensitivity level (plan M4-A). `.balanced` carries the
 /// M3-tuned values (`DistanceAttentionProfiles.standard`); `.conservative`
-/// and `.sensitive` re-map the same knobs — the preset-to-values mapping is
-/// implemented by M4-T02, the setting only records the user's choice.
+/// and `.sensitive` re-map the same knobs — the preset-to-values mapping
+/// lives in `profilesWithPreset(_:base:)` below (M4-T02); the setting only
+/// records the user's choice.
 ///
 /// Persisted as its `rawValue` string, so new cases can be added later
 /// without invalidating previously stored values.
@@ -90,6 +91,171 @@ struct AttentionSettings: Equatable {
             effective.releaseDuration = release
         }
         return effective
+    }
+}
+
+// MARK: - Sensitivity preset mapping (M4-T02, plan section 16)
+
+/// Applies a sensitivity preset to a whole set of distance-band profiles and
+/// returns the adjusted copy (pure function: `base` is never mutated).
+///
+/// The mapping shifts each band's tolerances and durations by fixed offsets
+/// relative to the base passed in, so the band relationships survive any
+/// future retuning of the base (M3-T06+): within every preset, near stays
+/// the strictest and fastest band and far the loosest and slowest; across
+/// presets, conservative < balanced < sensitive in strictness for every
+/// band. Applied to `DistanceAttentionProfiles.standard`, each preset's MID
+/// band reproduces the plan's headline numbers exactly — the settings menu
+/// displays those values (see `SensitivityPreset.classifierTolerances` /
+/// `baseTriggerDuration`).
+///
+/// Exact mapping (base = `DistanceAttentionProfiles.standard`):
+///
+///     Balanced — identity, the base profiles pass through unchanged:
+///
+///         band   yaw   pitch   trigger  release
+///         near   18°   15°     0.7 s    0.6 s
+///         mid    22°   18°     0.9 s    0.6 s
+///         far    27°   22°     1.2 s    0.6 s
+///
+///     Conservative — yaw −7° / pitch −6° (floored at 10°/8°),
+///     trigger +0.6 s, release +0.2 s (holds the shield longer, too):
+///
+///         band   yaw   pitch   trigger  release
+///         near   11°   9°      1.3 s    0.8 s
+///         mid    15°   12°     1.5 s    0.8 s
+///         far    20°   16°     1.8 s    0.8 s
+///
+///     Sensitive — yaw +8° / pitch +7°, trigger max(0.55, band − 0.3) s,
+///     release unchanged:
+///
+///         band   yaw   pitch   trigger  release
+///         near   26°   22°     0.55 s   0.6 s
+///         mid    30°   25°     0.6 s    0.6 s
+///         far    35°   29°     0.9 s    0.6 s
+///
+/// The floors are monotone — they can equalize two bands but never invert
+/// their order — and never activate on the standard profiles except the
+/// sensitive near trigger, which lands exactly on its 0.55 s floor. That
+/// floor is deliberately 0.55 s (not the 0.4 s first sketched in the plan
+/// notes) so every preset trigger stays strictly above the default `maxDelta`
+/// (0.5 s), honoring `AttentionTimingConfig`'s invariant that a single
+/// update can never raise the alert by itself.
+///
+/// Deliberately untouched by every preset: roll tolerance (±30°), the axis
+/// weights, the looking/notLooking thresholds, `uncertainGrace`, `maxDelta`,
+/// and the calibrated screen-center fields of every band config (calibration
+/// is owned by `ScreenCenterStore` and must never be corrupted by a preset
+/// change; `AdaptiveAttentionPolicy.classifierConfig` overlays the calibrated
+/// center afterwards, outside the preset path). The distance-band boundary
+/// fields (`nearMaxFaceWidth` / `midMaxFaceWidth` / `farMaxFaceWidth` on
+/// `AttentionSettings`) are likewise not consulted or modified here.
+func profilesWithPreset(_ preset: SensitivityPreset,
+                        base: DistanceAttentionProfiles) -> DistanceAttentionProfiles {
+    var profiles = base
+    profiles.near = preset.adjusted(base.near)
+    profiles.mid = preset.adjusted(base.mid)
+    profiles.far = preset.adjusted(base.far)
+    profiles.nearTiming = preset.adjusted(base.nearTiming)
+    profiles.midTiming = preset.adjusted(base.midTiming)
+    profiles.farTiming = preset.adjusted(base.farTiming)
+    return profiles
+}
+
+/// Headline per-preset values for the settings menu (plan section 16).
+extension SensitivityPreset {
+
+    /// Classifier tolerances for the preset (yaw/pitch) — the MID-band
+    /// values the menu displays. Roll stays ±30°, weights and looking/
+    /// notLooking thresholds unchanged. Derived from the band mapping
+    /// (`profilesWithPreset` on the standard profiles) so the headline
+    /// values can never drift from the actual per-band values.
+    func classifierTolerances() -> (yaw: Double, pitch: Double) {
+        let mid = profilesWithPreset(self, base: .standard).mid
+        return (mid.yawTolerance, mid.pitchTolerance)
+    }
+
+    /// Base trigger duration for the preset (seconds) — the MID-band value,
+    /// before per-band adaptation toward near/far and before any user
+    /// override (see `AttentionSettings.effectiveTimingConfig`).
+    func baseTriggerDuration() -> Double {
+        profilesWithPreset(self, base: .standard).midTiming.triggerDuration
+    }
+}
+
+/// Per-band adjustment underlying `profilesWithPreset`: fixed offsets per
+/// preset, documented there. Private so the mapping has exactly one
+/// description and one caller.
+private extension SensitivityPreset {
+
+    /// Tolerance shift for one band's classifier config. Only the yaw/pitch
+    /// tolerances move; roll, weights, thresholds and the screen center pass
+    /// through untouched.
+    func adjusted(_ config: AttentionClassifierConfig) -> AttentionClassifierConfig {
+        var adjusted = config
+        switch self {
+        case .balanced:
+            break  // identity: the base profiles ARE the M3-tuned values
+        case .conservative:
+            adjusted.yawTolerance = max(10.0, adjusted.yawTolerance - 7.0)
+            adjusted.pitchTolerance = max(8.0, adjusted.pitchTolerance - 6.0)
+        case .sensitive:
+            adjusted.yawTolerance += 8.0
+            adjusted.pitchTolerance += 7.0
+        }
+        return adjusted
+    }
+
+    /// Trigger/release shift for one band's timing config. `uncertainGrace`
+    /// and `maxDelta` pass through untouched.
+    func adjusted(_ config: AttentionTimingConfig) -> AttentionTimingConfig {
+        var adjusted = config
+        switch self {
+        case .balanced:
+            break
+        case .conservative:
+            adjusted.triggerDuration += 0.6
+            adjusted.releaseDuration += 0.2
+        case .sensitive:
+            // Floor 0.55 s keeps the trigger strictly above the default
+            // maxDelta (0.5 s) — see profilesWithPreset's docs.
+            adjusted.triggerDuration = max(0.55, adjusted.triggerDuration - 0.3)
+        }
+        return adjusted
+    }
+}
+
+// MARK: - Effective configuration (M4-T02)
+
+extension AttentionSettings {
+
+    /// Single entry point for the M4-T06 settings wiring: resolves this
+    /// settings value onto a full set of distance-band profiles.
+    ///
+    /// Precedence, later stages win:
+    ///
+    ///     preset → band adaptation → user override
+    ///
+    /// 1. The preset (`sensitivityPreset`) shifts every band's tolerances
+    ///    and durations coherently (`profilesWithPreset`).
+    /// 2. Band adaptation is baked into `base` — callers normally pass
+    ///    `DistanceAttentionProfiles.standard`, whose near/mid/far variants
+    ///    already encode the distance behavior the preset shifts.
+    /// 3. A non-nil `triggerDurationOverride` / `releaseDurationOverride`
+    ///    REPLACES the resulting band timing (`effectiveTimingConfig`),
+    ///    winning over both preset and band.
+    ///
+    /// Pure and calibration-safe: never mutates `base`, never touches
+    /// `ScreenCenterStore`, leaves the calibrated screen-center fields of
+    /// every band config and the distance-band boundary fields
+    /// (`nearMaxFaceWidth` / `midMaxFaceWidth` / `farMaxFaceWidth`) of this
+    /// settings value untouched.
+    func effectiveProfiles(base: DistanceAttentionProfiles) -> DistanceAttentionProfiles {
+        var profiles = profilesWithPreset(sensitivityPreset, base: base)
+        profiles.nearTiming = effectiveTimingConfig(base: profiles.nearTiming)
+        profiles.midTiming = effectiveTimingConfig(base: profiles.midTiming)
+        profiles.farTiming = effectiveTimingConfig(base: profiles.farTiming)
+        return profiles
     }
 }
 
