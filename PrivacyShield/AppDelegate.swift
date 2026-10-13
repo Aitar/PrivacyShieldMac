@@ -132,12 +132,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// `lastDisplayState` it decides the rendered status line, whichever
     /// path reported last.
     private var lastKnownSafe = true
-    
-    // Settings
-    var sensitivityThreshold: Float {
-        get { UserDefaults.standard.float(forKey: "matchThreshold").isZero ? 0.6 : UserDefaults.standard.float(forKey: "matchThreshold") }
-        set { UserDefaults.standard.set(newValue, forKey: "matchThreshold") }
-    }
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         // Disable App Nap so camera + detection stays active in background

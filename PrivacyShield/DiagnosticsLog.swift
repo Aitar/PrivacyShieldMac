@@ -18,6 +18,7 @@ import Foundation
 /// - `screen_calibration_on` / `screen_calibration_off` — screen-direction calibration session boundaries (M3-T04)
 /// - `legacy_shield_on` / `legacy_shield_off` — legacy owner-absent blur transitions
 /// - `metrics`              — periodic throughput/latency summary (~every 2 s)
+/// - `capture_metrics`      — periodic camera capture summary (~every 5 s)
 ///
 /// Field notes (plan sections 9/11, M1-T06 + M2-T07):
 /// - `track_id`: the tracker UUID in short form — the FIRST 8 CHARACTERS of
@@ -178,6 +179,22 @@ enum DiagnosticsLog {
             "latency_ms=\(String(format: "%.1f", latencyMS))",
             "faces=\(faceCount)",
             "recognitions=\(recognitions)"
+        ])
+    }
+
+    /// Periodic camera capture summary (M1-T03). The caller drives the ~5 s
+    /// cadence; `captureFPS` is the measured capture-side FPS over the last
+    /// ~1 s window, `throttled` flags capture running meaningfully below the
+    /// pinned format's FPS, and `format` names the pinned format (`nil` when
+    /// the device default was kept — reported as "unknown").
+    static func captureMetrics(captureFPS: Double, throttled: Bool, format: String?) {
+        guard isDebugLoggingEnabled else { return }
+
+        emit([
+            "event=capture_metrics",
+            "capture_fps=\(String(format: "%.1f", captureFPS))",
+            "throttled=\(throttled ? "true" : "false")",
+            "format=\(format ?? "unknown")"
         ])
     }
 

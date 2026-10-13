@@ -33,3 +33,4 @@ PrivacyShield.app/
 build.sh
 add_to_xcode.rb
 fix_permissions.rb
+.build/

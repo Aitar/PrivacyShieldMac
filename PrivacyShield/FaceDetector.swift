@@ -279,6 +279,14 @@ class FaceDetector: NSObject, CameraManagerDelegate {
 
     /// Minimum face size (0.0–1.0 of frame width) to trigger detection.
     /// Faces smaller than this are too far away to read the screen.
+    ///
+    /// This is the USER-CALIBRATED eligibility gate: it is persisted by
+    /// "Calibrate Detection Range…" and falls back to the first-launch
+    /// default of 0.25. It is deliberately distinct from the fixed M3
+    /// distance-band boundaries (`DistanceBandConfig` 0.28/0.16/0.09),
+    /// which adapt classifier/timing per band rather than gating detection.
+    /// Potential future unification: derive eligibility from distance bands
+    /// once 1–4 m tuning validates band-based eligibility.
     var minFaceSize: CGFloat {
         get {
             let val = CGFloat(UserDefaults.standard.float(forKey: "minFaceSize"))
@@ -652,7 +660,8 @@ class FaceDetector: NSObject, CameraManagerDelegate {
                         DiagnosticsLog.recognition(
                             trackID: track.id,
                             decision: "cached",
-                            reason: String(describing: reason)
+                            reason: String(describing: reason),
+                            identity: cachedIdentity
                         )
                     }
                 }

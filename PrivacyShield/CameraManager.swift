@@ -190,12 +190,13 @@ class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     }
 
     /// One-line metrics event, roughly every 5 s, ONLY when debug logging is
-    /// enabled. The UserDefaults flag is read on this 5 s cadence (not per
-    /// frame), so normal (non-debug) operation prints nothing and costs one
-    /// flag read per 5 s; toggling debug mode takes effect within ~5 s.
+    /// enabled. Gating (and the standard `ts=` timestamp prefix) live in
+    /// `DiagnosticsLog.captureMetrics`, so the UserDefaults flag is still
+    /// read on this 5 s cadence (not per frame); normal (non-debug) operation
+    /// prints nothing, and toggling debug mode takes effect within ~5 s.
     ///
     /// Format (matches the project's pipe-separated structured logging):
-    ///   PS | event=capture_metrics | capture_fps=29.8 | throttled=false | format=1920x1080@30
+    ///   ts=2026-10-13T10:12:33.412Z | event=capture_metrics | capture_fps=29.8 | throttled=false | format=1920x1080@30
     ///
     /// "throttled" is true when the measured capture FPS is meaningfully below
     /// the configured format FPS (< 90%). Because
@@ -205,9 +206,7 @@ class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     /// was pinned (device default kept), the reference FPS is unknown and
     /// throttled is reported as false (cannot be judged).
     private func emitCaptureMetricsLog() {
-        guard UserDefaults.standard.bool(forKey: "debugLoggingEnabled") else { return }
         let fps = captureFPS
-        let fpsText = String(format: "%.1f", fps)
         let formatSummary = configuredFormatSummary
         let throttled: Bool
         if let reference = configuredFPS {
@@ -215,7 +214,7 @@ class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         } else {
             throttled = false
         }
-        print("PS | event=capture_metrics | capture_fps=\(fpsText) | throttled=\(throttled ? "true" : "false") | format=\(formatSummary ?? "unknown")")
+        DiagnosticsLog.captureMetrics(captureFPS: fps, throttled: throttled, format: formatSummary)
     }
 
     private static let metricsWindowNanos: UInt64 = 1_000_000_000      // ~1 s FPS window
