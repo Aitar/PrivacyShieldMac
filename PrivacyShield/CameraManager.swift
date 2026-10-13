@@ -9,7 +9,57 @@ class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private var captureSession: AVCaptureSession?
     private weak var delegate: CameraManagerDelegate?
     private let videoDataOutputQueue = DispatchQueue(label: "com.privacyshield.videoqueue", qos: .userInitiated)
-    
+
+    // MARK: - Capture cadence metrics (M1-T03)
+
+    // Capture FPS is measured over consecutive ~1 s windows of didOutput
+    // callbacks (O(1) per frame: one clock read, one counter increment; the
+    // FPS figure is only recomputed when a window closes). All metric state
+    // is guarded by metricsLock because the video output queue writes it
+    // while other threads (debug layer, UI) read it.
+    //
+    // Dropped/throttled frames: with alwaysDiscardsLateVideoFrames = true a
+    // late frame is dropped instead of queued, so drops are NOT observable as
+    // a drop callback — they manifest as the measured capture FPS falling
+    // below the configured format FPS. "Throttled" is therefore defined as
+    // measured FPS < 90% of the configured FPS (see emitCaptureMetricsLog).
+    private let metricsLock = NSLock()
+    private var metricsFrameCount = 0
+    private var metricsWindowStartNanos: UInt64 = 0
+    private var metricsHasWindow = false
+    private var measuredCaptureFPS: Double = 0.0
+    private var nextMetricsLogNanos: UInt64?
+    private var configuredWidth: Int32?
+    private var configuredHeight: Int32?
+    private var configuredFPS: Int?
+
+    /// Capture FPS measured over the most recently completed ~1 s window of
+    /// didOutput callbacks. 0.0 until the first window completes. Written on
+    /// the video output queue, readable from any thread (thread-safe).
+    /// Vision-side processed FPS is a downstream concern (FaceDetector) and is
+    /// deliberately not measured here.
+    private(set) var captureFPS: Double {
+        get {
+            metricsLock.lock()
+            defer { metricsLock.unlock() }
+            return measuredCaptureFPS
+        }
+        set {
+            metricsLock.lock()
+            measuredCaptureFPS = newValue
+            metricsLock.unlock()
+        }
+    }
+
+    /// Human-readable configured capture format, e.g. "1920x1080@30"; nil
+    /// while no format has been pinned (device kept its default). Thread-safe.
+    var configuredFormatSummary: String? {
+        metricsLock.lock()
+        defer { metricsLock.unlock() }
+        guard let width = configuredWidth, let height = configuredHeight, let fps = configuredFPS else { return nil }
+        return "\(width)x\(height)@\(fps)"
+    }
+
     init(delegate: CameraManagerDelegate) {
         self.delegate = delegate
         super.init()
@@ -96,9 +146,80 @@ class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     }
     
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        recordCaptureSample()
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         delegate?.didOutput(pixelBuffer: pixelBuffer)
     }
+
+    // MARK: - Capture cadence metrics (M1-T03)
+
+    /// Counts a delivered frame and closes the ~1 s FPS window when due.
+    /// Called on the video output queue only. O(1) per frame: a monotonic
+    /// clock read and a counter increment; allocations only in the rare
+    /// window-close/log branch (about once per second at most).
+    private func recordCaptureSample() {
+        let now = DispatchTime.now().uptimeNanoseconds
+        var completedFPS: Double?
+        var metricsDue = false
+        metricsLock.lock()
+        if !metricsHasWindow {
+            metricsHasWindow = true
+            metricsWindowStartNanos = now
+            metricsFrameCount = 0
+            nextMetricsLogNanos = now + Self.metricsLogIntervalNanos
+        }
+        metricsFrameCount += 1
+        let elapsedNanos = now - metricsWindowStartNanos
+        if elapsedNanos >= Self.metricsWindowNanos {
+            completedFPS = Double(metricsFrameCount) * 1_000_000_000 / Double(elapsedNanos)
+            metricsFrameCount = 0
+            metricsWindowStartNanos = now
+        }
+        if let deadline = nextMetricsLogNanos, now >= deadline {
+            metricsDue = true
+            nextMetricsLogNanos = now + Self.metricsLogIntervalNanos
+        }
+        metricsLock.unlock()
+
+        if let fps = completedFPS {
+            captureFPS = fps
+        }
+        if metricsDue {
+            emitCaptureMetricsLog()
+        }
+    }
+
+    /// One-line metrics event, roughly every 5 s, ONLY when debug logging is
+    /// enabled. The UserDefaults flag is read on this 5 s cadence (not per
+    /// frame), so normal (non-debug) operation prints nothing and costs one
+    /// flag read per 5 s; toggling debug mode takes effect within ~5 s.
+    ///
+    /// Format (matches the project's pipe-separated structured logging):
+    ///   PS | event=capture_metrics | capture_fps=29.8 | throttled=false | format=1920x1080@30
+    ///
+    /// "throttled" is true when the measured capture FPS is meaningfully below
+    /// the configured format FPS (< 90%). Because
+    /// alwaysDiscardsLateVideoFrames = true silently drops late frames, a drop
+    /// has no callback of its own — it only shows up as capture FPS below the
+    /// configured FPS, which is exactly what this flag reports. When no format
+    /// was pinned (device default kept), the reference FPS is unknown and
+    /// throttled is reported as false (cannot be judged).
+    private func emitCaptureMetricsLog() {
+        guard UserDefaults.standard.bool(forKey: "debugLoggingEnabled") else { return }
+        let fps = captureFPS
+        let fpsText = String(format: "%.1f", fps)
+        let formatSummary = configuredFormatSummary
+        let throttled: Bool
+        if let reference = configuredFPS {
+            throttled = fps < 0.9 * Double(reference)
+        } else {
+            throttled = false
+        }
+        print("PS | event=capture_metrics | capture_fps=\(fpsText) | throttled=\(throttled ? "true" : "false") | format=\(formatSummary ?? "unknown")")
+    }
+
+    private static let metricsWindowNanos: UInt64 = 1_000_000_000      // ~1 s FPS window
+    private static let metricsLogIntervalNanos: UInt64 = 5_000_000_000 // log every ~5 s
 
     // MARK: - Camera format selection
 
@@ -131,6 +252,13 @@ class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
             device.activeVideoMinFrameDuration = frameDuration
             device.activeVideoMaxFrameDuration = frameDuration
             device.unlockForConfiguration()
+            // Record the actually-applied cadence only after the lock succeeded:
+            // it is the reference the throttled flag compares measured FPS against.
+            metricsLock.lock()
+            configuredWidth = selection.width
+            configuredHeight = selection.height
+            configuredFPS = selection.fps
+            metricsLock.unlock()
             let fpsText = String(format: "%.1f", Double(selection.fps))
             print("Camera format selected: \(selection.width)x\(selection.height) @ \(fpsText) FPS (\(device.localizedName)) [matched \(selection.tier)]")
         } catch {
