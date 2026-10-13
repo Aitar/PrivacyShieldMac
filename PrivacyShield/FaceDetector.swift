@@ -69,6 +69,17 @@ class FaceDetector: NSObject, CameraManagerDelegate {
 
     private var isProcessing = false
     private var frameCounter = 0
+    /// Process every Nth delivered frame — the primary CPU tuning lever
+    /// (M3-T07). At the pinned 30 FPS capture cadence (`CameraManager` tier 1,
+    /// 1920x1080 @ 30) this yields ~10 processed FPS; Vision face detection is
+    /// the dominant per-frame cost, so the processed rate scales ~1/N with this
+    /// constant (N = 4 → 7.5 processed FPS, a 25% Vision-load cut, NOT half —
+    /// halving means N = 6). Tradeoff: every frame-count-derived timing gets
+    /// coarser proportionally — the 0.7–1.2 s per-band trigger durations
+    /// quantize to whole samples (sample period 100 ms → 133 ms at N = 4) and
+    /// the frame-counted legacy debounce counters above (3/8 frames) stretch
+    /// from ~0.3/0.8 s to ~0.4/1.07 s. See docs/performance_report.md,
+    /// "Tuning levers".
     private let frameSkip = 3
     private var hasNotifiedStranger = false
 
