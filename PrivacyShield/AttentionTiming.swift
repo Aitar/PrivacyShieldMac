@@ -58,7 +58,7 @@ struct AttentionTimingConfig {
 /// handles results on the main queue).
 final class TemporalAttentionFilter {
 
-    private let config: AttentionTimingConfig
+    private var config: AttentionTimingConfig
 
     /// Whether the sustained-attention alert is currently latched.
     private(set) var isAlerting = false
@@ -122,6 +122,16 @@ final class TemporalAttentionFilter {
             }
         }
         return isAlerting
+    }
+
+    /// Swaps the timing configuration WITHOUT touching accumulated state
+    /// (M3-T04): a distance-band profile change must not reset a track's
+    /// pending accumulation or release an active alert — only the
+    /// configuration changes, applying from the next `update` onwards
+    /// (trigger/release/grace thresholds and the maxDelta clamp all read the
+    /// current config per update).
+    func updateConfig(_ config: AttentionTimingConfig) {
+        self.config = config
     }
 
     /// Clears all state: alert, accumulation and timers.

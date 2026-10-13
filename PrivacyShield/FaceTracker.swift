@@ -69,6 +69,13 @@ struct FaceTrack {
     /// pose. Written by the detector via `updateHeadPose`. Defaulted so
     /// existing memberwise initializers keep compiling.
     var latestHeadPose: HeadPoseResult? = nil
+    /// Hysteresis-stabilized distance band for this track (M3-T04), derived
+    /// from the normalized bounding-box width. `nil` until the detector's
+    /// first band classification; the previous value is the hysteresis state
+    /// `DistanceBandHysteresis.refined` needs across frames. Defaulted so
+    /// existing memberwise initializers keep compiling. Written by the
+    /// detector via `updateDistanceBand`.
+    var distanceBand: DistanceBand? = nil
 }
 
 // MARK: - Tunables (M2-T01, X-T01: all knobs in one place)
@@ -405,6 +412,20 @@ final class FaceTracker {
     func updateHeadPose(id: UUID, headPose: HeadPoseResult) -> Bool {
         guard var track = records[id] else { return false }
         track.latestHeadPose = headPose
+        records[id] = track
+        syncSnapshot(track)
+        return true
+    }
+
+    /// Writes the hysteresis-refined distance band onto the track (M3-T04).
+    /// The tracker only STORES the band (band policy lives in the detector);
+    /// persisting it here is what lets `DistanceBandHysteresis.refined` see
+    /// the previous band on the next frame. Returns `false` if the track no
+    /// longer exists.
+    @discardableResult
+    func updateDistanceBand(id: UUID, band: DistanceBand) -> Bool {
+        guard var track = records[id] else { return false }
+        track.distanceBand = band
         records[id] = track
         syncSnapshot(track)
         return true

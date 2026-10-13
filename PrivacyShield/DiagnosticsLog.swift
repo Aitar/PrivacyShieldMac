@@ -11,9 +11,11 @@ import Foundation
 ///     ts=2026-10-13T10:12:33.412Z | event=recognition | track_id=A1B2C3D4 | decision=recognize_now | reason=cadence elapsed: 2.51s ≥ 2.50s | identity=owner
 ///
 /// Emitted events:
-/// - `track`                — one per processed track per frame (M2-T07; replaces the M1 per-frame `face` event)
+/// - `track`                — one per processed track per frame (M2-T07; replaces the M1 per-frame `face` event); gains `distance_band` in M3-T04
 /// - `recognition`          — one per recognition-caching decision (recognize_now / cached)
 /// - `alert_on` / `alert_off`           — per-track temporal-filter transitions (with track_id)
+/// - `band_change`          — one per per-track distance-band change (M3-T04)
+/// - `screen_calibration_on` / `screen_calibration_off` — screen-direction calibration session boundaries (M3-T04)
 /// - `legacy_shield_on` / `legacy_shield_off` — legacy owner-absent blur transitions
 /// - `metrics`              — periodic throughput/latency summary (~every 2 s)
 ///
@@ -66,6 +68,7 @@ enum DiagnosticsLog {
         lookingSince: Date?,
         lastSeen: Date,
         lastIdentityCheck: Date?,
+        distanceBand: DistanceBand? = nil,
         now: Date,
         latencyMS: Double
     ) {
@@ -94,6 +97,9 @@ enum DiagnosticsLog {
             parts.append(contentsOf: ["attention_score=na", "attention_state=na"])
         }
 
+        // Distance band (M3-T04); `na` before the first band classification.
+        parts.append("distance_band=\(distanceBand.map { name(of: $0) } ?? "na")")
+
         // looking_duration_ms is 0.0 when the track is not in an active
         // looking episode (explicit zero, per M2-T07).
         let lookingDuration = lookingSince.map { max(0, now.timeIntervalSince($0)) } ?? 0
@@ -110,6 +116,23 @@ enum DiagnosticsLog {
         }
 
         parts.append("latency_ms=\(String(format: "%.1f", latencyMS))")
+        emit(parts)
+    }
+
+    /// One event per per-track distance-band change (M3-T04): `band` is the
+    /// hysteresis-refined band now in effect, `previous` the band the track
+    /// carried before this frame (`nil` for a new track's first
+    /// classification). Fires only on transitions, so band-stable frames add
+    /// no log lines.
+    static func bandChange(trackID: UUID, band: DistanceBand, previous: DistanceBand?) {
+        guard isDebugLoggingEnabled else { return }
+
+        var parts = [
+            "event=band_change",
+            "track_id=\(shortTrackID(trackID))",
+            "distance_band=\(name(of: band))"
+        ]
+        if let previous { parts.append("previous_band=\(name(of: previous))") }
         emit(parts)
     }
 
@@ -183,6 +206,16 @@ enum DiagnosticsLog {
         case .trusted: return "trusted"
         case .other: return "other"
         case .unknown: return "unknown"
+        }
+    }
+
+    /// Stable textual name for a `DistanceBand` (log-facing, M3-T04).
+    static func name(of band: DistanceBand) -> String {
+        switch band {
+        case .near: return "near"
+        case .mid: return "mid"
+        case .far: return "far"
+        case .tooFarOrUnreliable: return "too_far"
         }
     }
 

@@ -75,7 +75,10 @@ class FaceDetector: NSObject, CameraManagerDelegate {
     // MARK: - Per-track attention pipeline (M2-T03/T04)
 
     private let headPoseEstimator = HeadPoseEstimator()
-    private let attentionClassifier = AttentionClassifier()
+    // M3-T04 note: the single shared `AttentionClassifier` instance is gone —
+    // each track now classifies with its own band-adaptive config (see
+    // `AdaptiveAttentionPolicy`), instantiated per evaluation (a cheap value
+    // struct).
 
     /// Owns track lifecycle and per-track identity/attention state (M2-T01).
     /// Thread-confined to the video output queue alongside every other
@@ -91,7 +94,39 @@ class FaceDetector: NSObject, CameraManagerDelegate {
     /// configuration is shared — every track gets its OWN
     /// `TemporalAttentionFilter` instance, so accumulation state is never
     /// shared (stranger A's 0.5 s + stranger B's 0.5 s can never become 1.0 s).
+    /// Still the fallback for `.tooFarOrUnreliable` tracks, whose filters
+    /// never accumulate anything (they are only ever fed `.uncertain`).
     private let attentionTimingConfig = AttentionTimingConfig()
+
+    /// Distance-adaptive policy (M3-T04): per-band classifier/timing profiles.
+    private let adaptivePolicy = AdaptiveAttentionPolicy()
+
+    /// Stateless width → band classifier (M3-T03/T04); uses the default
+    /// (placeholder) boundaries until M3-T06 tuning.
+    private let distanceBandClassifier = DistanceBandClassifier()
+
+    /// Calibrated screen center (M3-T04), loaded once at init and refreshed
+    /// after each successful screen-direction calibration. `nil` = not
+    /// calibrated yet → per-band profiles fall back to the 0/0 frontal
+    /// assumption. Thread-confined to the video queue like every other
+    /// mutable member.
+    private var cachedScreenCenter: (yaw: Double, pitch: Double)?
+
+    // MARK: - Screen-direction calibration (M3-T04)
+
+    /// Active screen-direction calibration session state. `nil` when idle.
+    private var isScreenCalibrationActive = false
+    private var screenCalibrationStartedAt: Date?
+    private var screenCalibrationLeadIn: TimeInterval = 2.0
+    /// Timestamp of the first post-lead-in sample — anchors the collection
+    /// deadline exactly like the collector's own window anchor.
+    private var screenCalibrationFirstSampleAt: Date?
+    private let screenCalibrationCollector = ScreenDirectionCalibrationCollector()
+    private let screenCalibrationConfig = ScreenCalibrationConfig()
+    /// Small grace beyond the collection window so the last in-window frames
+    /// land before the session is declared failed.
+    private let screenCalibrationWindowGrace: TimeInterval = 0.25
+    private var screenCalibrationCompletion: ((Bool, ScreenCalibrationResult?) -> Void)?
 
     /// One temporal filter per live track, keyed by track UUID (M2-T04).
     /// Created when a track is created (lazily, on its first evaluation) and
@@ -142,6 +177,9 @@ class FaceDetector: NSObject, CameraManagerDelegate {
         self.shieldManager = shieldManager
         self.faceRecognizer = FaceRecognizer()
         self.delegate = delegate
+        // Load a previously calibrated screen center once (M3-T04); refreshed
+        // after every successful screen-direction calibration.
+        self.cachedScreenCenter = ScreenCenterStore.load()
         super.init()
     }
 
@@ -219,6 +257,21 @@ class FaceDetector: NSObject, CameraManagerDelegate {
             // calls hop to the main queue. The frame timestamp is captured
             // here so every temporal update uses the same per-frame instant.
             let frameDate = Date()
+
+            // Screen-direction calibration mode (M3-T04): collect head-pose
+            // samples from the largest in-range face while the LEGACY
+            // owner-absent path keeps running; the per-track attention/alert
+            // pipeline is skipped for the duration (like enrollment mode).
+            if isScreenCalibrationActive {
+                let latencyMS = (CFAbsoluteTimeGetCurrent() - processingStart) * 1000.0
+                stepScreenCalibration(nearbyFaces: nearbyFaces, at: frameDate)
+                recordFrameMetrics(latencyMS: latencyMS, faceCount: count)
+                let legacyActive = updateLegacyShieldState(strangerCondition: legacyStranger)
+                applyCombinedShield(legacyActive: legacyActive, attentionAlert: false)
+                isProcessing = false
+                return
+            }
+
             let frameSize = CGSize(width: CVPixelBufferGetWidth(pixelBuffer),
                                    height: CVPixelBufferGetHeight(pixelBuffer))
 
@@ -257,6 +310,29 @@ class FaceDetector: NSObject, CameraManagerDelegate {
                 let isNewTrack = association.newTracks.contains(track.id)
                 let isMatchedThisFrame = observationByTrack[track.id] != nil
 
+                // --- Distance band (M3-T04): normalized width → band, with
+                // per-track hysteresis across frames (the previous band lives
+                // on the track). Band changes are persisted, logged and apply
+                // the new timing profile WITHOUT resetting the filter.
+                let faceWidth = Double(track.boundingBox.width)
+                let rawBand = distanceBandClassifier.band(forNormalizedFaceWidth: faceWidth)
+                let previousBand = track.distanceBand
+                let band = DistanceBandHysteresis.refined(
+                    previous: previousBand,
+                    current: rawBand,
+                    width: faceWidth,
+                    config: .default
+                )
+                if band != previousBand {
+                    faceTracker.updateDistanceBand(id: track.id, band: band)
+                    if let timing = adaptivePolicy.timingConfig(for: band) {
+                        // Profile change must NOT reset accumulation (M3-T04
+                        // acceptance): updateConfig swaps configuration only.
+                        attentionFilter(for: track.id, band: band).updateConfig(timing)
+                    }
+                    DiagnosticsLog.bandChange(trackID: track.id, band: band, previous: previousBand)
+                }
+
                 // --- Attention input (M2-T03): pose → classifier.
                 // No fresh detection this frame (short miss / gray zone) is
                 // an explicitly UNAVAILABLE pose → .uncertain: unknown
@@ -268,12 +344,24 @@ class FaceDetector: NSObject, CameraManagerDelegate {
                     pose = .unavailable
                 }
                 faceTracker.updateHeadPose(id: track.id, headPose: pose)
-                let attention = attentionClassifier.classify(pose)
+
+                // Band-adaptive classification (M3-T04): each band scores
+                // with its own tolerances around the calibrated screen
+                // center. `.tooFarOrUnreliable` gets NO classifier config —
+                // an unreliable far face is fed `.uncertain` directly and can
+                // never accumulate looking time toward an alert.
+                let attention: AttentionResult
+                if let classifierConfig = adaptivePolicy.classifierConfig(for: band,
+                                                                          screenCenter: cachedScreenCenter) {
+                    attention = AttentionClassifier(config: classifierConfig).classify(pose)
+                } else {
+                    attention = AttentionResult(state: .uncertain, score: 0.0)
+                }
 
                 // --- Per-track temporal state machine (M2-T04). Each track
                 // feeds ONLY its own filter; filters are updated exclusively
                 // here on the video queue with the frame timestamp.
-                let filter = attentionFilter(for: track.id)
+                let filter = attentionFilter(for: track.id, band: band)
                 let wasTrackAlerting = filter.isAlerting
                 let accumBefore = filter.accumulatedLookingTime
                 let isTrackAlerting = filter.update(attention.state, at: frameDate)
@@ -384,6 +472,7 @@ class FaceDetector: NSObject, CameraManagerDelegate {
                     lookingSince: lookingSince,
                     lastSeen: track.lastSeen,
                     lastIdentityCheck: refreshed?.lastIdentityCheck,
+                    distanceBand: band,
                     now: frameDate,
                     latencyMS: latencyMS
                 )
@@ -410,30 +499,7 @@ class FaceDetector: NSObject, CameraManagerDelegate {
             // the legacy owner-absent blur or any qualifying track's alert
             // demands it. Edge-driven only (no per-frame icon refresh) so the
             // two paths can never fight over the icon. UI calls hop to main.
-            let shieldNeeded = legacyActive || attentionAlert
-            if shieldNeeded != isShieldActive {
-                isShieldActive = shieldNeeded
-                let show = shieldNeeded
-                let shouldNotify = shieldNeeded && !hasNotifiedStranger
-                if shieldNeeded {
-                    hasNotifiedStranger = true
-                } else {
-                    hasNotifiedStranger = false
-                }
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    if show {
-                        self.shieldManager.showShield()
-                        self.delegate?.updateMenuIcon(safe: false)
-                        if shouldNotify {
-                            self.delegate?.sendStrangerNotification()
-                        }
-                    } else {
-                        self.shieldManager.hideShield()
-                        self.delegate?.updateMenuIcon(safe: true)
-                    }
-                }
-            }
+            applyCombinedShield(legacyActive: legacyActive, attentionAlert: attentionAlert)
 
             isProcessing = false
         } catch {
@@ -445,12 +511,14 @@ class FaceDetector: NSObject, CameraManagerDelegate {
     // MARK: - Per-track pipeline helpers (M2-T03/T04/T06)
 
     /// Returns the temporal filter for a track, creating it on first use with
-    /// the shared timing config (each filter keeps its OWN accumulation
-    /// state — M2-T04: per-track durations are identical values, never shared
-    /// state).
-    private func attentionFilter(for trackID: UUID) -> TemporalAttentionFilter {
+    /// the band-adaptive timing config (M3-T04; falls back to the shared M1
+    /// timing config for `.tooFarOrUnreliable`, whose filter never accumulates
+    /// anything). Each filter keeps its OWN accumulation state — M2-T04:
+    /// per-track durations are identical values, never shared state.
+    private func attentionFilter(for trackID: UUID, band: DistanceBand) -> TemporalAttentionFilter {
         if let existing = attentionFilters[trackID] { return existing }
-        let created = TemporalAttentionFilter(config: attentionTimingConfig)
+        let config = adaptivePolicy.timingConfig(for: band) ?? attentionTimingConfig
+        let created = TemporalAttentionFilter(config: config)
         attentionFilters[trackID] = created
         return created
     }
@@ -553,6 +621,145 @@ class FaceDetector: NSObject, CameraManagerDelegate {
             metricsLatencySum = 0
             metricsWindowStart = now
             recognitionCount = 0
+        }
+    }
+
+    /// Combines the legacy owner-absent path with the attention-alert path
+    /// (OR) and applies the resulting shield state edge-driven: the shield
+    /// stays up while either path demands it, and only state CHANGES drive
+    /// UI calls (no per-frame icon refresh) so the two paths can never fight
+    /// over the icon. UI calls hop to main. Extracted verbatim from the
+    /// recognition path so the screen-direction calibration mode drives the
+    /// exact same combined logic.
+    private func applyCombinedShield(legacyActive: Bool, attentionAlert: Bool) {
+        let shieldNeeded = legacyActive || attentionAlert
+        guard shieldNeeded != isShieldActive else { return }
+        isShieldActive = shieldNeeded
+        let show = shieldNeeded
+        let shouldNotify = shieldNeeded && !hasNotifiedStranger
+        if shieldNeeded {
+            hasNotifiedStranger = true
+        } else {
+            hasNotifiedStranger = false
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if show {
+                self.shieldManager.showShield()
+                self.delegate?.updateMenuIcon(safe: false)
+                if shouldNotify {
+                    self.delegate?.sendStrangerNotification()
+                }
+            } else {
+                self.shieldManager.hideShield()
+                self.delegate?.updateMenuIcon(safe: true)
+            }
+        }
+    }
+
+    // MARK: - Screen-direction calibration (M3-T04)
+
+    /// Starts screen-direction calibration: after a short lead-in, feeds the largest in-range face's
+    /// head-pose samples into a ScreenDirectionCalibrationCollector for ~3 s, saves the result via
+    /// ScreenCenterStore.save, applies the new center to subsequent classifications, then calls the
+    /// completion exactly once: success=true + result, or success=false + nil (too few valid samples).
+    ///
+    /// Frame-driven like the other calibration modes: samples arrive with
+    /// processed frames, so the session only advances while the camera runs.
+    /// While active, the per-track attention/alert path is skipped (the
+    /// legacy owner-absent path keeps running); tracks simply go stale and
+    /// expire on the first post-calibration frame.
+    func startScreenDirectionCalibration(leadIn: TimeInterval = 2.0,
+                                         completion: @escaping (_ success: Bool, _ result: ScreenCalibrationResult?) -> Void) {
+        // A session is already running: fail the new request immediately
+        // (the active session keeps its own exactly-once completion).
+        guard !isScreenCalibrating else {
+            completion(false, nil)
+            return
+        }
+        screenCalibrationCollector.reset()
+        screenCalibrationLeadIn = leadIn
+        screenCalibrationStartedAt = Date()
+        screenCalibrationFirstSampleAt = nil
+        isScreenCalibrationActive = true
+        screenCalibrationCompletion = completion
+        DiagnosticsLog.transition("screen_calibration_on",
+                                  detail: String(format: "lead_in=%.1fs", leadIn))
+    }
+
+    /// True while a screen-direction calibration session is collecting.
+    var isScreenCalibrating: Bool {
+        isScreenCalibrationActive
+    }
+
+    /// One calibration step per processed frame (video queue): after the
+    /// lead-in, feed the largest in-range face's pose (or `.unavailable`,
+    /// which counts toward the validity rate) into the collector; finish the
+    /// session as soon as it succeeds or the ~3 s collection window is
+    /// exhausted. Owner presence is assumed during calibration, so identity
+    /// is deliberately NOT consulted.
+    private func stepScreenCalibration(nearbyFaces: [VNFaceObservation], at now: Date) {
+        guard let startedAt = screenCalibrationStartedAt else { return }
+
+        // Lead-in: let the user settle into position before any sample counts.
+        guard now.timeIntervalSince(startedAt) >= screenCalibrationLeadIn else { return }
+
+        let pose: HeadPoseResult
+        if let largest = nearbyFaces.max(by: { $0.boundingBox.width < $1.boundingBox.width }) {
+            pose = headPoseEstimator.pose(from: largest)
+        } else {
+            pose = .unavailable
+        }
+        if screenCalibrationFirstSampleAt == nil {
+            screenCalibrationFirstSampleAt = now
+        }
+        screenCalibrationCollector.add(pose, at: now)
+
+        // Success as soon as enough valid samples are in and the robust
+        // statistics accept them (`finish()` is idempotent and cheap here).
+        if screenCalibrationCollector.isComplete,
+           let result = screenCalibrationCollector.finish() {
+            finishScreenCalibration(result: result)
+            return
+        }
+
+        // Window exhausted without enough valid samples → failure. The
+        // collector itself ignores post-window samples, so the deadline is
+        // the first sample plus the collection window (+ small grace).
+        if let first = screenCalibrationFirstSampleAt,
+           now.timeIntervalSince(first) > screenCalibrationConfig.collectionWindow + screenCalibrationWindowGrace {
+            finishScreenCalibration(result: nil)
+        }
+    }
+
+    /// Ends the session exactly once: on success saves the center, refreshes
+    /// the cached center used by subsequent classifications and logs; the
+    /// completion is always dispatched to the main queue (mirroring the
+    /// range-calibration completion pattern).
+    private func finishScreenCalibration(result: ScreenCalibrationResult?) {
+        guard isScreenCalibrationActive else { return }
+        isScreenCalibrationActive = false
+        screenCalibrationStartedAt = nil
+        screenCalibrationFirstSampleAt = nil
+        let completion = screenCalibrationCompletion
+        screenCalibrationCompletion = nil
+
+        if let result {
+            ScreenCenterStore.save(result)
+            cachedScreenCenter = (result.centerYaw, result.centerPitch)
+            DiagnosticsLog.transition("screen_calibration_off", detail: String(
+                format: "center_yaw=%+.2f center_pitch=%+.2f samples=%d validity=%.2f",
+                result.centerYaw, result.centerPitch, result.sampleCount, result.validityRate
+            ))
+        } else {
+            DiagnosticsLog.transition("screen_calibration_off", detail: "failed_too_few_valid_samples")
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            // Detached completion (detector gone before the hop): dropped —
+            // exactly-once still holds because the caller observes no call.
+            guard self != nil else { return }
+            completion?(result != nil, result)
         }
     }
 
