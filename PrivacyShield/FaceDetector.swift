@@ -4,7 +4,10 @@ import Foundation
 
 protocol FaceDetectorDelegate: AnyObject {
     func updateMenuIcon(safe: Bool)
-    func sendStrangerNotification()
+    // Notifications and the menu status line flow through the reason-aware
+    // `PrivacyDisplayReporting.privacyStateChanged(to:)` contract (M4-T06) —
+    // the undifferentiated `sendStrangerNotification` entry point was
+    // removed so exactly ONE notification path stays active.
 }
 
 // MARK: - Global alert aggregation (M2-T04)
@@ -50,22 +53,107 @@ struct ShoulderSurfAggregator {
     }
 }
 
+// MARK: - Settings → policy mappings (M4-T06)
+
+/// Pure M4-T06 mappings between the persisted `AttentionSettings` (M4-T01)
+/// and the runtime policy objects, extracted from `FaceDetector` so they are
+/// unit-testable without instantiating the detector (which needs a
+/// `ShieldManager` and a camera). No state, no clock, no singletons.
+enum PrivacySettingsMapping {
+
+    /// Maps a shield reason onto the aggregate display state reported to the
+    /// app delegate (M4-T04 contract). The three blur reasons map 1:1;
+    /// `.none` reports `.monitoringSafe`. The device states
+    /// (`.calibrating` / `.cameraUnavailable`) are never produced here —
+    /// the detector reports `.calibrating` directly around its calibration
+    /// sessions, and `.cameraUnavailable` is reported by the app delegate at
+    /// launch (the detector has no signal for it).
+    static func displayState(for reason: PrivacyShieldReason) -> PrivacyDisplayState {
+        switch reason {
+        case .none:            return .monitoringSafe
+        case .ownerAbsent:     return .ownerAbsent
+        case .shoulderSurfer:  return .shoulderSurferDetected
+        case .both:            return .bothPoliciesActive
+        }
+    }
+
+    /// Builds the privacy state machine config from the user settings: the
+    /// two blur toggles ("Blur When I Leave" / "Blur When Someone Watches")
+    /// map 1:1 onto the M4-T03 policy toggles. The owner-presence window
+    /// keeps its default — there is no user-facing knob for it yet.
+    static func privacyConfig(from settings: AttentionSettings) -> PrivacyStateMachineConfig {
+        PrivacyStateMachineConfig(
+            blurWhenOwnerAbsent: settings.blurWhenOwnerAbsent,
+            blurWhenShoulderSurferDetected: settings.blurWhenShoulderSurferDetected)
+    }
+
+    /// Builds the distance-band config from the settings' band boundary
+    /// fields (`nearMaxFaceWidth` / `midMaxFaceWidth` / `farMaxFaceWidth`,
+    /// M4-T01). Defaults equal `DistanceBandConfig.default`, so first-launch
+    /// behavior is unchanged; the fields become tuning inputs the moment a
+    /// future settings surface writes them.
+    static func bandConfig(from settings: AttentionSettings) -> DistanceBandConfig {
+        var config = DistanceBandConfig()
+        config.nearMaxWidth = settings.nearMaxFaceWidth
+        config.midMaxWidth = settings.midMaxFaceWidth
+        config.farMaxWidth = settings.farMaxFaceWidth
+        return config
+    }
+}
+
 class FaceDetector: NSObject, CameraManagerDelegate {
     private let shieldManager: ShieldManager
     let faceRecognizer: FaceRecognizer
     private weak var delegate: FaceDetectorDelegate?
 
-    // Anti-glitch debounce, now used ONLY by the legacy owner-absent blur
-    // path: the unknown-face trigger that used to share these counters was
-    // replaced by per-track time-based filters (M2-T04). Logic unchanged
-    // from M1; it now runs on the video queue like the rest of the pipeline.
-    private var consecutiveStranger = 0
-    private var consecutiveSafe = 0
-    private let strangerThreshold = 3     // Frames before SHOWING legacy blur
-    private let safeThreshold = 8         // Frames before HIDING legacy blur (higher = more stable)
-    private var isLegacyShieldActive = false
-    /// Combined shield state: legacy owner-absent blur OR attention alert.
-    private var isShieldActive = false
+    // MARK: - Privacy policy (M4-T06)
+
+    /// Pure decision core for the two independent privacy policies (M4-T03).
+    /// Replaces the legacy owner-absent debounce + OR combination: the
+    /// shield now shows exactly when the evaluated `PrivacyShieldReason` is
+    /// shown (`isShieldShown`). Its config is rebuilt from the user settings
+    /// whenever they change (see `rebuildDerivedState`); var because the
+    /// struct's config is swapped in place there.
+    private var privacyStateMachine = PrivacyStateMachine()
+
+    /// The reason currently applied to the shield/icon paths (video-queue
+    /// confined). Edge tracker: only reason CHANGES drive UI calls, so the
+    /// paths can never fight over the icon. Starts `.none` (shield hidden),
+    /// matching the pre-frame world and keeping the first safe frame
+    /// free of redundant UI calls.
+    private var lastAppliedReason: PrivacyShieldReason = .none
+
+    /// The display state last reported via
+    /// `PrivacyDisplayReporting.privacyStateChanged(to:)` (video-queue
+    /// confined). Separate from `lastAppliedReason` because calibration
+    /// wraps the REPORTED state as `.calibrating` while the shield keeps
+    /// following the reason underneath.
+    private var lastReportedState: PrivacyDisplayState?
+
+    // MARK: - User settings (M4-T01/T06)
+
+    /// The user's attention/shield settings, loaded once at init and
+    /// refreshed by `applySettings` whenever the menu changes anything.
+    ///
+    /// Threading: written from the main thread (menu actions) and read on
+    /// the video output queue (once per processed frame), so the value is
+    /// guarded by a small lock (the same pattern as `CameraManager`'s
+    /// metrics). The DERIVED runtime state — privacy config, per-band
+    /// profiles, band classifier boundaries, per-track filter timing
+    /// configs — is rebuilt exclusively on the video queue (see
+    /// `rebuildDerivedState`), so the pipeline's mutable state stays
+    /// queue-confined exactly as before.
+    private var settingsStorage: AttentionSettings
+    private let settingsLock = NSLock()
+    private var settings: AttentionSettings {
+        get { settingsLock.lock(); defer { settingsLock.unlock() }; return settingsStorage }
+        set { settingsLock.lock(); settingsStorage = newValue; settingsLock.unlock() }
+    }
+
+    /// The settings snapshot the derived pipeline state was last built from
+    /// (video-queue confined). A mismatch with the locked `settings` value
+    /// triggers a rebuild at the top of the next processed frame.
+    private var appliedSettings: AttentionSettings?
 
     private var isProcessing = false
     private var frameCounter = 0
@@ -76,12 +164,12 @@ class FaceDetector: NSObject, CameraManagerDelegate {
     /// constant (N = 4 → 7.5 processed FPS, a 25% Vision-load cut, NOT half —
     /// halving means N = 6). Tradeoff: every frame-count-derived timing gets
     /// coarser proportionally — the 0.7–1.2 s per-band trigger durations
-    /// quantize to whole samples (sample period 100 ms → 133 ms at N = 4) and
-    /// the frame-counted legacy debounce counters above (3/8 frames) stretch
-    /// from ~0.3/0.8 s to ~0.4/1.07 s. See docs/performance_report.md,
-    /// "Tuning levers".
+    /// quantize to whole samples (sample period 100 ms → 133 ms at N = 4).
+    /// The M1 frame-counted owner-absent debounce this comment used to
+    /// describe is gone since M4-T06: owner absence is now time-based
+    /// (`ownerPresenceWindow`), so no frame counter participates in any
+    /// shield decision. See docs/performance_report.md, "Tuning levers".
     private let frameSkip = 3
-    private var hasNotifiedStranger = false
 
     // MARK: - Per-track attention pipeline (M2-T03/T04)
 
@@ -100,21 +188,32 @@ class FaceDetector: NSObject, CameraManagerDelegate {
     /// Identity-cache policy (M2-T05 config, applied by M2-T06).
     private let recognitionPolicy = RecognitionCachePolicy()
 
-    /// Shared TIMING CONFIG for all per-track filters (M2-T04): trigger 0.9 s
-    /// / release 0.6 s / grace 0.35 s, the M1 prototype values. Only the
+    /// Shared TIMING CONFIG fallback for all per-track filters (M2-T04):
+    /// used only by `.tooFarOrUnreliable` tracks, whose filters never
+    /// accumulate anything (they are only ever fed `.uncertain`). Only the
     /// configuration is shared — every track gets its OWN
     /// `TemporalAttentionFilter` instance, so accumulation state is never
     /// shared (stranger A's 0.5 s + stranger B's 0.5 s can never become 1.0 s).
-    /// Still the fallback for `.tooFarOrUnreliable` tracks, whose filters
-    /// never accumulate anything (they are only ever fed `.uncertain`).
-    private let attentionTimingConfig = AttentionTimingConfig()
+    /// Rebuilt from the user's trigger/release overrides whenever settings
+    /// change (M4-T06); var for that reason.
+    private var attentionTimingConfig = AttentionTimingConfig()
 
     /// Distance-adaptive policy (M3-T04): per-band classifier/timing profiles.
-    private let adaptivePolicy = AdaptiveAttentionPolicy()
+    /// The profile SET is rebuilt from the user settings (preset + overrides
+    /// via `AttentionSettings.effectiveProfiles`, M4-T06); var for that
+    /// reason. Rebuilds happen on the video queue only.
+    private var adaptivePolicy = AdaptiveAttentionPolicy()
 
-    /// Stateless width → band classifier (M3-T03/T04); uses the default
-    /// (placeholder) boundaries until M3-T06 tuning.
-    private let distanceBandClassifier = DistanceBandClassifier()
+    /// Stateless width → band classifier (M3-T03/T04). Recreated whenever
+    /// the settings' band boundaries change (M4-T06, `PrivacySettingsMapping.
+    /// bandConfig`); var for that reason.
+    private var distanceBandClassifier = DistanceBandClassifier()
+
+    /// Band boundaries + hysteresis margin currently in effect (M4-T06):
+    /// derived from the settings' band boundary fields and shared by the
+    /// classifier AND the per-track hysteresis refinement, so the two can
+    /// never disagree about where a band ends. Video-queue confined.
+    private var distanceBandConfig = DistanceBandConfig()
 
     /// Calibrated screen center (M3-T04), loaded once at init and refreshed
     /// after each successful screen-direction calibration. `nil` = not
@@ -160,6 +259,23 @@ class FaceDetector: NSObject, CameraManagerDelegate {
     private var metricsLatencySum = 0.0
     private var metricsWindowStart: Date?
     private let metricsInterval: TimeInterval = 2.0
+    /// Vision throughput of the most recently closed metrics window (M4-T06):
+    /// surfaces in the debug preview while no window is open. `nil` before
+    /// the first window closes.
+    private var lastVisionFPS: Double?
+
+    // MARK: - Debug preview (M4-T05/T06)
+
+    /// Pure state sink for the debug overlay (M4-T05). Created eagerly (a
+    /// value holder with no side effects); the overlay WINDOW is only
+    /// created by `setDebugPreviewVisible(true)`, so normal menu-bar-only
+    /// operation never builds one. Pushes are a pure sink — nothing in the
+    /// pipeline reads the model back.
+    private let debugPreviewModel = DebugPreviewModel()
+    /// The overlay window controller; created lazily on the main thread by
+    /// `setDebugPreviewVisible(true)`. `nil` while the preview was never
+    /// shown.
+    private var debugPreviewWindowController: DebugPreviewWindowController?
 
     /// Minimum face size (0.0–1.0 of frame width) to trigger detection.
     /// Faces smaller than this are too far away to read the screen.
@@ -191,7 +307,48 @@ class FaceDetector: NSObject, CameraManagerDelegate {
         // Load a previously calibrated screen center once (M3-T04); refreshed
         // after every successful screen-direction calibration.
         self.cachedScreenCenter = ScreenCenterStore.load()
+        // M4-T06: load the persisted user settings once and record them as
+        // the applied baseline. No frames have run yet, so the
+        // tracker/filter tables are empty and the derived rebuild below is
+        // queue-safe on the main thread.
+        let loaded = AttentionSettingsStore.load()
+        self.settingsStorage = loaded
+        self.appliedSettings = loaded
         super.init()
+        self.rebuildDerivedState(from: loaded)
+    }
+
+    /// Replaces the active settings (M4-T06). Called by the app delegate
+    /// after it persists a change. Thread-safe: the value is stored under a
+    /// lock and picked up on the video output queue at the top of the next
+    /// processed frame, where the derived policy state is rebuilt — the
+    /// pipeline's mutable state stays video-queue confined.
+    func applySettings(_ s: AttentionSettings) {
+        settings = s
+    }
+
+    /// Rebuilds every settings-derived piece of pipeline state (M4-T06).
+    /// Called from init and from the video queue only (see `applySettings`):
+    /// - the two blur toggles → `PrivacyStateMachineConfig`,
+    /// - sensitivity preset + trigger/release overrides → per-band profiles
+    ///   (`AttentionSettings.effectiveProfiles` — the single M4-T02 entry
+    ///   point) and the shared `.tooFarOrUnreliable` fallback timing,
+    /// - the band boundary fields → classifier + hysteresis config,
+    /// - the resulting band timing → every LIVE per-track filter via
+    ///   `updateConfig`, which swaps configuration WITHOUT touching
+    ///   accumulation state (M3-T04 contract).
+    private func rebuildDerivedState(from s: AttentionSettings) {
+        privacyStateMachine.config = PrivacySettingsMapping.privacyConfig(from: s)
+        adaptivePolicy.profiles = s.effectiveProfiles(base: .standard)
+        distanceBandConfig = PrivacySettingsMapping.bandConfig(from: s)
+        distanceBandClassifier = DistanceBandClassifier(config: distanceBandConfig)
+        attentionTimingConfig = s.effectiveTimingConfig(base: AttentionTimingConfig())
+        for (trackID, filter) in attentionFilters {
+            guard let band = faceTracker.track(withID: trackID)?.distanceBand else { continue }
+            if let timing = adaptivePolicy.timingConfig(for: band) {
+                filter.updateConfig(timing)
+            }
+        }
     }
 
     func didOutput(pixelBuffer: CVPixelBuffer) {
@@ -199,6 +356,15 @@ class FaceDetector: NSObject, CameraManagerDelegate {
         guard frameCounter % frameSkip == 0 else { return }
         guard !isProcessing else { return }
         isProcessing = true
+
+        // M4-T06: pick up settings changes (written from the main thread by
+        // `applySettings`) and rebuild the derived policy state here on the
+        // video queue, keeping every pipeline mutation queue-confined.
+        let currentSettings = settings
+        if currentSettings != appliedSettings {
+            appliedSettings = currentSettings
+            rebuildDerivedState(from: currentSettings)
+        }
 
         // Enrollment mode
         if isEnrolling {
@@ -257,11 +423,6 @@ class FaceDetector: NSObject, CameraManagerDelegate {
             let nearbyFaces = faces.filter { $0.boundingBox.width >= softThreshold }
             let nearbyCount = nearbyFaces.count
 
-            // Legacy global safe logic condition (replaced in M2/M4):
-            // owner-absent blur (no face at all → user walked away) plus the
-            // not-enrolled multi-face rule, preserved exactly as before.
-            let legacyStranger = (count == 0) || (!faceRecognizer.isEnrolled && nearbyCount > 1)
-
             // Everything below runs ON the video queue (didOutput's queue) —
             // the tracker, per-track filters, recognition cache and shield
             // decisions are all video-queue confined; only the imperative UI
@@ -270,15 +431,27 @@ class FaceDetector: NSObject, CameraManagerDelegate {
             let frameDate = Date()
 
             // Screen-direction calibration mode (M3-T04): collect head-pose
-            // samples from the largest in-range face while the LEGACY
-            // owner-absent path keeps running; the per-track attention/alert
-            // pipeline is skipped for the duration (like enrollment mode).
+            // samples from the largest in-range face while the privacy
+            // policy keeps running on a reduced input (M4-T06): owner
+            // presence is assumed whenever ANY face is in range — identity
+            // is deliberately not consulted during calibration — and the
+            // per-track attention/alert pipeline is skipped for the duration
+            // (like enrollment mode). The reported display state is
+            // `.calibrating` regardless of the shield reason underneath.
             if isScreenCalibrationActive {
                 let latencyMS = (CFAbsoluteTimeGetCurrent() - processingStart) * 1000.0
                 stepScreenCalibration(nearbyFaces: nearbyFaces, at: frameDate)
                 recordFrameMetrics(latencyMS: latencyMS, faceCount: count)
-                let legacyActive = updateLegacyShieldState(strangerCondition: legacyStranger)
-                applyCombinedShield(legacyActive: legacyActive, attentionAlert: false)
+                // Preserved unenrolled fallback (see the recognition path):
+                // with no enrollment every face maps to .owner, so multiple
+                // in-range faces are treated as potential observers.
+                let surferDetected = currentSettings.shoulderSurfDetectionEnabled
+                    && !faceRecognizer.isEnrolled
+                    && nearbyCount > 1
+                let reason = privacyStateMachine.evaluate(
+                    ownerPresent: !nearbyFaces.isEmpty,
+                    shoulderSurferDetected: surferDetected)
+                applyPrivacyDecision(reason: reason, calibrating: true)
                 isProcessing = false
                 return
             }
@@ -316,6 +489,18 @@ class FaceDetector: NSObject, CameraManagerDelegate {
             var observations: [ShoulderSurfAggregator.TrackObservation] = []
             observations.reserveCapacity(liveTracks.count)
 
+            // Owner-presence snapshots (M4-T06): (identity, lastSeen) with
+            // THIS frame's post-recognition identity — fed to
+            // `OwnerPresencePolicy.ownerPresent` after the loop.
+            var presenceSnapshots: [(identity: IdentityState, lastSeen: Date)] = []
+            presenceSnapshots.reserveCapacity(liveTracks.count)
+
+            // Debug preview rows (M4-T05/T06): built only while the preview
+            // is enabled; a pure sink, never read back by the pipeline.
+            let debugPreviewEnabled = currentSettings.debugPreviewEnabled
+            var debugFaces: [DebugFaceInfo] = []
+            if debugPreviewEnabled { debugFaces.reserveCapacity(liveTracks.count) }
+
             for track in liveTracks {
                 let previous = previousTracks[track.id]
                 let isNewTrack = association.newTracks.contains(track.id)
@@ -332,7 +517,7 @@ class FaceDetector: NSObject, CameraManagerDelegate {
                     previous: previousBand,
                     current: rawBand,
                     width: faceWidth,
-                    config: .default
+                    config: distanceBandConfig
                 )
                 if band != previousBand {
                     faceTracker.updateDistanceBand(id: track.id, band: band)
@@ -493,6 +678,29 @@ class FaceDetector: NSObject, CameraManagerDelegate {
                     identity: identity,
                     isAlerting: isTrackAlerting
                 ))
+                presenceSnapshots.append((identity: identity, lastSeen: track.lastSeen))
+
+                if debugPreviewEnabled {
+                    let poseInfo: (yaw: Double, pitch: Double, roll: Double)?
+                    if case .valid(let pose) = refreshed?.latestHeadPose {
+                        poseInfo = (pose.yaw, pose.pitch, pose.roll)
+                    } else {
+                        poseInfo = nil
+                    }
+                    debugFaces.append(DebugFaceInfo(
+                        trackID: track.id,
+                        identity: identity,
+                        boundingBox: track.boundingBox,
+                        faceWidth: faceWidth,
+                        distanceBand: band,
+                        yaw: poseInfo?.yaw,
+                        pitch: poseInfo?.pitch,
+                        roll: poseInfo?.roll,
+                        attentionScore: attention.score,
+                        attentionState: attention.state,
+                        lookingDuration: filter.accumulatedLookingTime
+                    ))
+                }
             }
 
             // Global aggregation (M2-T04): any qualifying track alerting
@@ -501,16 +709,52 @@ class FaceDetector: NSObject, CameraManagerDelegate {
 
             recordFrameMetrics(latencyMS: latencyMS, faceCount: count)
 
-            // MARK: Legacy global safe logic (replaced in M2/M4)
-            // Owner-absent blur debounce, preserved exactly; the counters now
-            // live on the video queue with the rest of the pipeline.
-            let legacyActive = updateLegacyShieldState(strangerCondition: legacyStranger)
+            // MARK: Privacy policy (M4-T06; replaces the legacy path)
+            //
+            // The two independent M4-T03 inputs:
+            // - Owner presence: a trusted-level (owner/trusted) track seen
+            //   within `ownerPresenceWindow` — evaluated from this frame's
+            //   post-recognition snapshots. This replaces the legacy
+            //   "no face at all" 3/8-frame debounce entirely: a stranger
+            //   still in frame no longer keeps the screen "safe", and the
+            //   blur engages once the owner's track has been unseen for the
+            //   window (track expiry is 1.0 s, so ~1.0–1.5 s after leaving
+            //   with the default window of 1.5 s). The per-track
+            //   `TemporalAttentionFilter` trigger durations (M1-T07,
+            //   settings-overridable) own ALL looking-time debouncing.
+            // - Shoulder-surf input: the aggregator's result AND the master
+            //   switch, plus the preserved unenrolled fallback — with no
+            //   enrollment the recognition path maps every face to `.owner`
+            //   (M1 parity, see the recognition block), so the aggregator
+            //   could never qualify anyone; multiple in-range faces while
+            //   unenrolled are therefore treated as potential observers,
+            //   exactly the legacy `!isEnrolled && nearbyCount > 1` rule.
+            let ownerPresent = OwnerPresencePolicy.ownerPresent(
+                in: presenceSnapshots,
+                now: frameDate,
+                presenceWindow: privacyStateMachine.config.ownerPresenceWindow
+            )
+            let surferDetected = currentSettings.shoulderSurfDetectionEnabled
+                && (attentionAlert
+                    || (!faceRecognizer.isEnrolled && nearbyCount > 1))
 
-            // Combine both paths with OR: the shield stays up while either
-            // the legacy owner-absent blur or any qualifying track's alert
-            // demands it. Edge-driven only (no per-frame icon refresh) so the
-            // two paths can never fight over the icon. UI calls hop to main.
-            applyCombinedShield(legacyActive: legacyActive, attentionAlert: attentionAlert)
+            let reason = privacyStateMachine.evaluate(
+                ownerPresent: ownerPresent,
+                shoulderSurferDetected: surferDetected
+            )
+            // Edge-driven application: reason changes drive shield + icon;
+            // display-state changes drive the status line + reason-aware
+            // notifications (via AppDelegate.privacyStateChanged — the ONE
+            // notification path since M4-T06).
+            applyPrivacyDecision(reason: reason, calibrating: false)
+
+            // Debug preview (M4-T05/T06): one snapshot per processed frame,
+            // pushed to the pure state sink. Never alters decisions.
+            if debugPreviewEnabled {
+                publishDebugPreview(faces: debugFaces,
+                                    latencyMS: latencyMS,
+                                    activeTrackCount: liveTracks.count)
+            }
 
             isProcessing = false
         } catch {
@@ -580,35 +824,7 @@ class FaceDetector: NSObject, CameraManagerDelegate {
         return newIdentity
     }
 
-    // MARK: Legacy global safe logic (replaced in M2/M4)
-
-    /// Owner-absent blur (no face at all → the user walked away → protect
-    /// the screen) plus the not-enrolled multi-face rule, preserved exactly
-    /// as before the attention pipeline existed. The counters below are the
-    /// original anti-glitch debounce; they now see ONLY the legacy condition
-    /// because the unknown-face trigger moved to the per-track filters.
-    private func updateLegacyShieldState(strangerCondition: Bool) -> Bool {
-        if strangerCondition {
-            consecutiveStranger += 1
-            consecutiveSafe = 0  // Reset safe counter
-
-            // Only SHOW the legacy blur after sustained absence
-            if !isLegacyShieldActive && consecutiveStranger >= strangerThreshold {
-                isLegacyShieldActive = true
-                DiagnosticsLog.transition("legacy_shield_on", detail: "owner_absent_or_unenrolled_multi_face")
-            }
-        } else {
-            consecutiveSafe += 1
-            consecutiveStranger = 0  // Reset stranger counter
-
-            // Only HIDE the legacy blur after sustained presence (prevents flickering)
-            if isLegacyShieldActive && consecutiveSafe >= safeThreshold {
-                isLegacyShieldActive = false
-                DiagnosticsLog.transition("legacy_shield_off", detail: "presence_restored")
-            }
-        }
-        return isLegacyShieldActive
-    }
+    // MARK: - Privacy decision application (M4-T06)
 
     /// Accumulates per-frame stats and emits a `metrics` event roughly every
     /// `metricsInterval` seconds (silent unless debug logging is enabled).
@@ -622,8 +838,11 @@ class FaceDetector: NSObject, CameraManagerDelegate {
 
         let elapsed = now.timeIntervalSince(windowStart)
         if elapsed >= metricsInterval {
+            let visionFPS = Double(metricsFrameCount) / max(elapsed, 1e-9)
+            // M4-T06: kept for the debug preview (Vision FPS line).
+            lastVisionFPS = visionFPS
             DiagnosticsLog.metrics(
-                visionFPS: Double(metricsFrameCount) / max(elapsed, 1e-9),
+                visionFPS: visionFPS,
                 latencyMS: metricsLatencySum / Double(metricsFrameCount),
                 faceCount: faceCount,
                 recognitions: recognitionCount
@@ -635,35 +854,91 @@ class FaceDetector: NSObject, CameraManagerDelegate {
         }
     }
 
-    /// Combines the legacy owner-absent path with the attention-alert path
-    /// (OR) and applies the resulting shield state edge-driven: the shield
-    /// stays up while either path demands it, and only state CHANGES drive
-    /// UI calls (no per-frame icon refresh) so the two paths can never fight
-    /// over the icon. UI calls hop to main. Extracted verbatim from the
-    /// recognition path so the screen-direction calibration mode drives the
-    /// exact same combined logic.
-    private func applyCombinedShield(legacyActive: Bool, attentionAlert: Bool) {
-        let shieldNeeded = legacyActive || attentionAlert
-        guard shieldNeeded != isShieldActive else { return }
-        isShieldActive = shieldNeeded
-        let show = shieldNeeded
-        let shouldNotify = shieldNeeded && !hasNotifiedStranger
-        if shieldNeeded {
-            hasNotifiedStranger = true
-        } else {
-            hasNotifiedStranger = false
+    /// Applies one privacy decision edge-driven (M4-T06; replaces
+    /// `applyCombinedShield`): only reason CHANGES drive the shield and the
+    /// menu icon, and only display-state CHANGES are reported to the app
+    /// delegate — which derives the reason-aware notifications AND the menu
+    /// status line from that single call, so exactly one notification path
+    /// is active. Video-queue only; UI calls hop to main.
+    ///
+    /// `calibrating` wraps the REPORTED state as `.calibrating` (M4-T04
+    /// device state) while the shield keeps following the reason underneath:
+    /// during a calibration session the owner-presence input is the coarse
+    /// "any face in range" signal, so a mid-calibration departure still
+    /// blurs; its notification (if any) fires when the session ends and the
+    /// mapped state becomes reportable again.
+    private func applyPrivacyDecision(reason: PrivacyShieldReason, calibrating: Bool) {
+        let displayState: PrivacyDisplayState = calibrating
+            ? .calibrating
+            : PrivacySettingsMapping.displayState(for: reason)
+
+        if reason != lastAppliedReason {
+            lastAppliedReason = reason
+            let show = reason.isShieldShown
+            DiagnosticsLog.transition(show ? "shield_on" : "shield_off",
+                                      detail: "reason=\(reason.description)")
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if show {
+                    self.shieldManager.showShield()
+                } else {
+                    self.shieldManager.hideShield()
+                }
+                self.delegate?.updateMenuIcon(safe: !show)
+            }
         }
+
+        if displayState != lastReportedState {
+            lastReportedState = displayState
+            (delegate as? PrivacyDisplayReporting)?.privacyStateChanged(to: displayState)
+        }
+    }
+
+    // MARK: - Debug preview (M4-T05/T06)
+
+    /// Builds one `DebugPreviewState` from the processed frame and pushes it
+    /// into the pure state sink. Called from the video queue; the model
+    /// hops its observable effects to the main thread internally.
+    ///
+    /// Not representable from here (left `nil` in the state): the camera
+    /// capture FPS and the configured camera format — both live inside
+    /// `CameraManager`, whose public surface does not expose them to the
+    /// detector.
+    private func publishDebugPreview(faces: [DebugFaceInfo],
+                                     latencyMS: Double,
+                                     activeTrackCount: Int) {
+        var state = DebugPreviewState()
+        state.faces = faces
+        state.captureFPS = nil          // capture-side metrics live in CameraManager
+        state.visionFPS = lastVisionFPS // nil until the first ~2 s window closes
+        state.latencyMs = latencyMS
+        state.activeTrackCount = activeTrackCount
+        state.cameraFormat = nil        // CameraManager's format summary is not reachable here
+        if let center = cachedScreenCenter {
+            state.screenCenter = DebugScreenCenter(yaw: center.yaw, pitch: center.pitch)
+        }
+        debugPreviewModel.update(state)
+    }
+
+    /// Shows or hides the debug preview overlay (M4-T06 menu wiring). The
+    /// window controller is created lazily on the first show, on the main
+    /// thread; hiding only orders the window out and costs nothing per
+    /// frame (the per-frame push is additionally gated on the persisted
+    /// `debugPreviewEnabled` setting).
+    func setDebugPreviewVisible(_ visible: Bool) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            if show {
-                self.shieldManager.showShield()
-                self.delegate?.updateMenuIcon(safe: false)
-                if shouldNotify {
-                    self.delegate?.sendStrangerNotification()
+            if visible {
+                if self.debugPreviewWindowController == nil {
+                    let controller = DebugPreviewWindowController()
+                    self.debugPreviewModel.onStateChanged = { [weak controller] state in
+                        controller?.render(state)
+                    }
+                    self.debugPreviewWindowController = controller
                 }
+                self.debugPreviewWindowController?.show()
             } else {
-                self.shieldManager.hideShield()
-                self.delegate?.updateMenuIcon(safe: true)
+                self.debugPreviewWindowController?.hide()
             }
         }
     }
@@ -678,8 +953,9 @@ class FaceDetector: NSObject, CameraManagerDelegate {
     /// Frame-driven like the other calibration modes: samples arrive with
     /// processed frames, so the session only advances while the camera runs.
     /// While active, the per-track attention/alert path is skipped (the
-    /// legacy owner-absent path keeps running); tracks simply go stale and
-    /// expire on the first post-calibration frame.
+    /// privacy policy keeps running on the reduced "any face in range =
+    /// owner present" input, M4-T06); tracks simply go stale and expire on
+    /// the first post-calibration frame.
     func startScreenDirectionCalibration(leadIn: TimeInterval = 2.0,
                                          completion: @escaping (_ success: Bool, _ result: ScreenCalibrationResult?) -> Void) {
         // A session is already running: fail the new request immediately

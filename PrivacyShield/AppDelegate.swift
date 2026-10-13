@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Foundation
 import Carbon.HIToolbox
 import UserNotifications
@@ -123,7 +124,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// episode, per-reason dedup, min interval between reason-change updates).
     private var notificationGate = NotificationGate()
     /// Last display state reported via `privacyStateChanged(to:)`. nil until
-    /// the M4-T06 integration starts reporting; the legacy
+    /// the detector reports its first state; the legacy
     /// `updateMenuIcon(safe:)` path then falls back to the generic
     /// safe/shield-active line because it cannot name the reason.
     private var lastDisplayState: PrivacyDisplayState?
@@ -146,23 +147,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenu()
         registerGlobalHotKey()
         requestNotificationPermission()
-        
+
+        // Camera-unavailable status (M4-T06): a denied/restricted camera
+        // authorization at launch can never deliver frames, so surface it
+        // through the existing display-state machinery ("📷 Camera
+        // unavailable"). The detector cannot produce this state (it never
+        // sees a frame in that case); once frames flow, its state reports
+        // replace this line.
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .denied, .restricted:
+            privacyStateChanged(to: .cameraUnavailable)
+        default:
+            break
+        }
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             self?.startPrivacyShield()
         }
     }
-    
+
     private func startPrivacyShield() {
         let shield = ShieldManager()
         self.shieldManager = shield
-        
+
         let detector = FaceDetector(shieldManager: shield, delegate: self)
         self.faceDetector = detector
-        
+
         let camera = CameraManager(delegate: detector)
         self.cameraManager = camera
-        
+
         camera.checkPermissionAndStart()
+        // Restore the debug preview when it was enabled (M4-T06): the
+        // detector loads the persisted settings itself, but the overlay
+        // window needs the explicit visibility call.
+        detector.setDebugPreviewVisible(AttentionSettingsStore.load().debugPreviewEnabled)
         updateMenuIcon(safe: true)
     }
 
@@ -183,71 +201,154 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     private func rebuildMenu() {
         let menu = NSMenu()
-        
+
         // Status
         let statusItem = NSMenuItem(title: "Status: Initializing…", action: nil, keyEquivalent: "")
         statusItem.tag = 100
         menu.addItem(statusItem)
         menu.addItem(NSMenuItem.separator())
-        
-        // Enrollment
-        let enrollItem = NSMenuItem(title: "Enroll My Face", action: #selector(enrollFace), keyEquivalent: "e")
-        enrollItem.target = self
-        menu.addItem(enrollItem)
-        
-        let addUserItem = NSMenuItem(title: "Add Trusted Face", action: #selector(addTrustedFace), keyEquivalent: "")
-        addUserItem.target = self
-        menu.addItem(addUserItem)
-        
-        let resetItem = NSMenuItem(title: "Reset All Enrollments", action: #selector(resetEnrollment), keyEquivalent: "r")
-        resetItem.target = self
-        menu.addItem(resetItem)
-        
+
+        // M4-T06 settings toggles — every checkmark reflects the persisted
+        // store, so a rebuild is always consistent with what the detector
+        // was handed via `applySettings`.
+        let settings = AttentionSettingsStore.load()
+
+        let shoulderItem = NSMenuItem(title: "Shoulder Surf Detection",
+                                      action: #selector(toggleShoulderSurfDetection), keyEquivalent: "")
+        shoulderItem.target = self
+        shoulderItem.state = settings.shoulderSurfDetectionEnabled ? .on : .off
+        menu.addItem(shoulderItem)
+
+        let blurAwayItem = NSMenuItem(title: "Blur When I Leave",
+                                      action: #selector(toggleBlurWhenOwnerAbsent), keyEquivalent: "")
+        blurAwayItem.target = self
+        blurAwayItem.state = settings.blurWhenOwnerAbsent ? .on : .off
+        menu.addItem(blurAwayItem)
+
+        let blurWatchItem = NSMenuItem(title: "Blur When Someone Watches",
+                                       action: #selector(toggleBlurWhenShoulderSurferDetected), keyEquivalent: "")
+        blurWatchItem.target = self
+        blurWatchItem.state = settings.blurWhenShoulderSurferDetected ? .on : .off
+        menu.addItem(blurWatchItem)
+
         menu.addItem(NSMenuItem.separator())
-        
+
+        // Attention Sensitivity submenu (M4-T02 presets; radio state is the
+        // persisted preset).
+        let sensitivityItem = NSMenuItem(title: "Attention Sensitivity", action: nil, keyEquivalent: "")
+        let sensitivityMenu = NSMenu()
+        for preset in [SensitivityPreset.conservative, .balanced, .sensitive] {
+            let item = NSMenuItem(title: sensitivityMenuTitle(preset),
+                                  action: #selector(setSensitivity(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = preset.rawValue
+            item.state = settings.sensitivityPreset == preset ? .on : .off
+            sensitivityMenu.addItem(item)
+        }
+        sensitivityItem.submenu = sensitivityMenu
+        menu.addItem(sensitivityItem)
+
+        // Looking Duration submenu (M4-T06): the user's trigger-duration
+        // override. "Band Default" (first item, checked when no override is
+        // stored) restores the preset/band value; the numeric items are
+        // checked when the stored override equals them exactly.
+        let durationItem = NSMenuItem(title: "Looking Duration", action: nil, keyEquivalent: "")
+        let durationMenu = NSMenu()
+        let bandDefaultItem = NSMenuItem(title: "Band Default",
+                                         action: #selector(setLookingDuration(_:)), keyEquivalent: "")
+        bandDefaultItem.target = self
+        bandDefaultItem.state = settings.triggerDurationOverride == nil ? .on : .off
+        durationMenu.addItem(bandDefaultItem)
+        for seconds in [0.5, 0.8, 1.0, 1.5] {
+            let item = NSMenuItem(title: String(format: "%.1f s", seconds),
+                                  action: #selector(setLookingDuration(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = seconds
+            item.state = settings.triggerDurationOverride == seconds ? .on : .off
+            durationMenu.addItem(item)
+        }
+        durationItem.submenu = durationMenu
+        menu.addItem(durationItem)
+
+        menu.addItem(NSMenuItem.separator())
+
         // Calibration
         let calibrateDirectionItem = NSMenuItem(title: "Calibrate Screen Direction…", action: #selector(calibrateScreenDirection), keyEquivalent: "")
         calibrateDirectionItem.target = self
         menu.addItem(calibrateDirectionItem)
-        
+
         let calibrateItem = NSMenuItem(title: "Calibrate Detection Range…", action: #selector(calibrateRange), keyEquivalent: "")
         calibrateItem.target = self
         menu.addItem(calibrateItem)
-        
+
         let currentThreshold = UserDefaults.standard.float(forKey: "minFaceSize")
         let thresholdLabel = currentThreshold > 0 ? String(format: "Current threshold: %.0f%%", currentThreshold * 100) : "Current: default (2 ft)"
         let thresholdItem = NSMenuItem(title: thresholdLabel, action: nil, keyEquivalent: "")
         thresholdItem.tag = 300
         menu.addItem(thresholdItem)
-        
+
         // Debug-only: current calibrated screen center (updates via tag 400)
         if UserDefaults.standard.bool(forKey: "debugLoggingEnabled") {
             let centerItem = NSMenuItem(title: screenCenterMenuLine(), action: nil, keyEquivalent: "")
             centerItem.tag = 400
             menu.addItem(centerItem)
         }
-        
+
+        // Debug preview overlay (M4-T05/T06)
+        let previewItem = NSMenuItem(title: "Debug Preview…",
+                                     action: #selector(toggleDebugPreview), keyEquivalent: "")
+        previewItem.target = self
+        previewItem.state = settings.debugPreviewEnabled ? .on : .off
+        menu.addItem(previewItem)
+
         menu.addItem(NSMenuItem.separator())
-        
+
+        // Enrollment
+        let enrollItem = NSMenuItem(title: "Enroll My Face", action: #selector(enrollFace), keyEquivalent: "e")
+        enrollItem.target = self
+        menu.addItem(enrollItem)
+
+        let addUserItem = NSMenuItem(title: "Add Trusted Face", action: #selector(addTrustedFace), keyEquivalent: "")
+        addUserItem.target = self
+        menu.addItem(addUserItem)
+
+        let resetItem = NSMenuItem(title: "Reset All Enrollments", action: #selector(resetEnrollment), keyEquivalent: "r")
+        resetItem.target = self
+        menu.addItem(resetItem)
+
+        menu.addItem(NSMenuItem.separator())
+
         // Toggle
         let toggleItem = NSMenuItem(title: "Toggle Shield (⌘⇧L)", action: #selector(toggleShield), keyEquivalent: "")
         toggleItem.target = self
         menu.addItem(toggleItem)
-        
+
         menu.addItem(NSMenuItem.separator())
-        
+
         // Settings
         let launchItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         launchItem.target = self
         launchItem.state = isLaunchAtLoginEnabled() ? .on : .off
         launchItem.tag = 200
         menu.addItem(launchItem)
-        
+
         menu.addItem(NSMenuItem.separator())
 
         menu.addItem(NSMenuItem(title: "Quit Privacy Shield", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
         self.statusItem.menu = menu
+    }
+
+    /// Submenu title for a sensitivity preset (M4-T06): the plain preset
+    /// name — the plan's per-preset headline values are what the preset
+    /// maps to (`SensitivityPreset.classifierTolerances`), not part of the
+    /// menu label.
+    private func sensitivityMenuTitle(_ preset: SensitivityPreset) -> String {
+        switch preset {
+        case .conservative: return "Conservative"
+        case .balanced: return "Balanced"
+        case .sensitive: return "Sensitive"
+        }
     }
     
     func updateMenuIcon(safe: Bool) {
@@ -279,9 +380,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// The status line for the CURRENT signals: a reported display state wins
     /// when it agrees with the legacy safe flag; otherwise the generic
-    /// fallback that matches what the legacy safe/unsafe signal can know (the
-    /// pre-M4-T06 combined path ORs the owner-absent debounce with the
-    /// attention alert, so an unsafe report alone cannot name the reason).
+    /// fallback renders what the safe/unsafe icon signal alone can know.
+    /// The fallback exists for the manual shield toggle (⌘⇧L) and any
+    /// pre-report window at launch — the detector's M4-T06 state reports
+    /// name the reason whenever they agree with the icon flag.
     private func statusLineText() -> String {
         if let state = lastDisplayState {
             switch (lastKnownSafe, state) {
@@ -333,6 +435,54 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     @objc func toggleShield() {
         shieldManager?.toggleShield()
+    }
+
+    // MARK: - Settings actions (M4-T06)
+
+    /// Persists one settings mutation, pushes the resulting settings into
+    /// the detector (picked up on its video queue before the next frame)
+    /// and rebuilds the menu so every checkmark reflects the store.
+    private func updateSettings(_ mutate: (inout AttentionSettings) -> Void) {
+        AttentionSettingsStore.update(defaults: .standard, mutate)
+        faceDetector?.applySettings(AttentionSettingsStore.load())
+        rebuildMenu()
+    }
+
+    @objc func toggleShoulderSurfDetection() {
+        updateSettings { $0.shoulderSurfDetectionEnabled.toggle() }
+    }
+
+    @objc func toggleBlurWhenOwnerAbsent() {
+        updateSettings { $0.blurWhenOwnerAbsent.toggle() }
+    }
+
+    @objc func toggleBlurWhenShoulderSurferDetected() {
+        updateSettings { $0.blurWhenShoulderSurferDetected.toggle() }
+    }
+
+    /// Sensitivity preset radio item; the raw value rides in
+    /// `representedObject`.
+    @objc func setSensitivity(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let preset = SensitivityPreset(rawValue: raw) else { return }
+        updateSettings { $0.sensitivityPreset = preset }
+    }
+
+    /// Looking-duration radio item: a numeric item stores the seconds as a
+    /// `Double` override; "Band Default" has no representedObject and
+    /// therefore stores `nil` (the override is removed and the preset/band
+    /// value applies again).
+    @objc func setLookingDuration(_ sender: NSMenuItem) {
+        updateSettings { $0.triggerDurationOverride = sender.representedObject as? Double }
+    }
+
+    /// Debug preview toggle (M4-T05/T06): persists the flag, hands the new
+    /// settings to the detector (gating its per-frame state pushes) and
+    /// shows/hides the overlay window itself.
+    @objc func toggleDebugPreview() {
+        let enable = !AttentionSettingsStore.load().debugPreviewEnabled
+        updateSettings { $0.debugPreviewEnabled = enable }
+        faceDetector?.setDebugPreviewVisible(enable)
     }
     
     @objc func calibrateRange() {
@@ -458,22 +608,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     // MARK: - Notifications
-    
+
     private func requestNotificationPermission() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
             print("Notification permission: \(granted)")
         }
     }
-    
-    /// Legacy undifferentiated entry point (FaceDetectorDelegate
-    /// requirement). The pre-M4-T06 combined path cannot tell WHY the shield
-    /// came on (it ORs the owner-absent debounce with the attention alert),
-    /// so it reports the shoulder-surf reason — the closest match to the old
-    /// "unrecognized face" text. M4-T06 replaces this with reason-aware
-    /// `privacyStateChanged(to:)` reporting.
-    func sendStrangerNotification() {
-        sendNotification(for: .shoulderSurfer)
-    }
+
+    // The legacy undifferentiated `sendStrangerNotification()` entry point
+    // was removed in M4-T06: the detector now reports display states via
+    // `privacyStateChanged(to:)`, and this app delegate derives BOTH the
+    // notification (reason-aware, gated below) and the menu status line
+    // from that single path — exactly one notification path is active.
 
     /// Sends the reason-aware shield notification (M4-T04), gated by
     /// `NotificationGate` anti-spam rules (one send per episode, never twice
