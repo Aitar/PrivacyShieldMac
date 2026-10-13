@@ -1,0 +1,4 @@
+distance_m,lighting,camera,num_faces,identity,yaw_deg,pitch_deg,roll_deg,face_width,attention_score,attention_state,triggered,trigger_latency_ms,expected,actual,notes
+1,indoor-day,FaceTime HD,1,stranger,2.1,-1.0,0.4,0.31,0.91,looking,yes,940,trigger,trigger,EXAMPLE placeholder data only - not measured
+2,indoor-day,FaceTime HD,1,stranger,34.8,-2.2,1.1,0.19,0.24,notLooking,no,,no_trigger,no_trigger,EXAMPLE placeholder data only - not measured
+1,indoor-day,FaceTime HD,2,owner+stranger,1.2,-0.8,0.3,0.30,0.89,looking,yes,1010,trigger,trigger,EXAMPLE placeholder data only - not measured; owner track attention fields na; release_ms=620
